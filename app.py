@@ -2,11 +2,15 @@
 Toposheet Viewer and Map Exporter - single file, Pillow-only export (no matplotlib).
 Run:  streamlit run app.py
 Needs: streamlit, requests, geopandas, shapely, pyproj, pillow>=10.1, pmtiles
+Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN env/secret recommended).
+Each .pmtiles is downloaded once to a local cache; a failing sheet is skipped, never fatal.
 The export runs in a separate worker process ("--export <dir>") so a crash/OOM never kills the app.
+Live map: the browser tries the local proxy first, then falls back to direct Hugging Face URLs
+(needed when deployed, where 127.0.0.1 is the visitor's machine). Every failure is logged on the map.
 """
 import os, re, io, sys, gc, json, math, time, uuid, shutil, zipfile, tempfile, textwrap, threading, subprocess
 import faulthandler
-from functools import lru_cache
+from urllib.parse import quote, unquote
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -18,58 +22,129 @@ except Exception:
 
 import requests
 import geopandas as gpd
-from shapely.geometry import box
+from shapely.geometry import box, shape
+from shapely.ops import unary_union
 from PIL import Image, ImageDraw, ImageFont
 from pmtiles.reader import Reader
 
 Image.MAX_IMAGE_PIXELS = None  # 800 DPI pages exceed Pillow's default bomb limit
 
-GITHUB_USER, GITHUB_REPO, RELEASE_TAG = "Himanshu03111999", "toposheet-storage", "v1.0.0"
+HF_REPO = "himanshuguptta/geotiff-hub"
+HF_BASE = f"https://huggingface.co/datasets/{HF_REPO}"
+HF_TREE = f"https://huggingface.co/api/datasets/{HF_REPO}/tree/main?recursive=true"
 PROXY_PORT, TILE_WORKERS, JOB_TTL = 8765, 8, 1800
-API = f"https://api.github.com/repos/{GITHUB_USER}/{GITHUB_REPO}"
 R = 6378137.0
-BUF10_COLOR = "#b30000"
+COLORS = ["#000000", "#d00000", "#0057ff"]  # smallest buffer / in-between / largest buffer
 DPI_OPTIONS = [300, 500, 800]
 
-TOKEN = os.getenv("GITHUB_TOKEN")
+TOKEN = os.getenv("HF_TOKEN")
 session = requests.Session()  # pooled connections
 if TOKEN:
     session.headers.update({"Authorization": f"Bearer {TOKEN}"})
 
 
 # =====================================================================================
-# SHARED: GitHub range fetch
+# SHARED: Hugging Face file cache + local range reads (asset id = path inside the repo)
 # =====================================================================================
-@lru_cache(maxsize=256)
-def fetch_range(asset_id, rng=None):
-    h = {"Accept": "application/octet-stream"}
-    if rng:
-        h["Range"] = rng
-    last = None
-    for attempt in range(3):
-        try:
-            r = session.get(f"{API}/releases/assets/{asset_id}", headers=h, timeout=30)
-            if r.status_code >= 500 or r.status_code in (401, 403, 404, 429):
-                raise RuntimeError(f"HTTP {r.status_code}")
-            return r.status_code, r.headers.get("Content-Range"), r.content
-        except Exception as e:
-            last = e
-            time.sleep(0.5 * (attempt + 1))
-    raise last
+CACHE = os.path.join(tempfile.gettempdir(), "topo_cache")
+os.makedirs(CACHE, exist_ok=True)
+_LOCKS, _FAIL = {}, {}
+
+
+def local_file(path):
+    """Download a dataset file once (with retries), then always read it from disk."""
+    p = os.path.join(CACHE, path.replace("/", "__"))
+    if os.path.exists(p):
+        return p
+    if time.time() - _FAIL.get(path, 0) < 20:  # failed just now: don't retry on every tile request
+        raise RuntimeError(f"download of {path} failed recently")
+    with _LOCKS.setdefault(path, threading.Lock()):  # per-file lock: other sheets are never blocked
+        if os.path.exists(p):
+            return p
+        tmp, last = f"{p}.{os.getpid()}.part", None
+        for attempt in range(6):
+            try:
+                with session.get(f"{HF_BASE}/resolve/main/{quote(path)}", stream=True, timeout=60,
+                                 headers={"Accept-Encoding": "identity"}) as r:
+                    if r.status_code == 429:
+                        time.sleep(min(float(r.headers.get("Retry-After", 5)), 30))
+                    r.raise_for_status()
+                    with open(tmp, "wb") as f:
+                        for c in r.iter_content(1 << 20):
+                            f.write(c)
+                os.replace(tmp, p)
+                return p
+            except Exception as e:
+                last = e
+                print(f"DOWNLOAD RETRY {attempt + 1}/6 {path}: {e!r}", flush=True)
+                time.sleep(3 * (attempt + 1))
+        _FAIL[path] = time.time()
+        raise last
+
+
+def fetch_range(path, rng=None):
+    p = local_file(path)
+    size = os.path.getsize(p)
+    m = re.match(r"bytes=(\d+)-(\d*)", rng or "")
+    with open(p, "rb") as f:
+        if not m:
+            return 200, None, f.read()
+        a = int(m.group(1))
+        b = min(int(m.group(2)) if m.group(2) else size - 1, size - 1)
+        f.seek(a)
+        return 206, f"bytes {a}-{b}/{size}", f.read(max(b - a + 1, 0))
 
 
 _BOUNDS = {}
 
 
 def sheet_bounds(asset_id):
-    """(min_lon, min_lat, max_lon, max_lat) of a PMTiles sheet; failures are not cached."""
+    """(min_lon, min_lat, max_lon, max_lat) of a PMTiles sheet; failures return None and are not cached."""
     if asset_id not in _BOUNDS:
         try:
             h = Reader(lambda o, l: fetch_range(asset_id, f"bytes={o}-{o + l - 1}")[2]).header()
             _BOUNDS[asset_id] = tuple(h[k] / 1e7 for k in ("min_lon_e7", "min_lat_e7", "max_lon_e7", "max_lat_e7"))
-        except Exception:
+        except Exception as e:
+            print(f"BOUNDS ERROR {asset_id}: {e!r}", flush=True)
             return None
     return _BOUNDS[asset_id]
+
+
+# ---------------- vectors + buffers (shared by app and export worker) ----------------
+def parse_buffers(txt):
+    """'200m, 2km, 10km' -> sorted metres (0 < d <= 20 km)"""
+    v = [float(n) * (1000 if u == "km" else 1)
+         for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*(km|m)(?:eters?)?(?![a-z])", txt.lower())]
+    return sorted({m for m in v if 0 < m <= 20000})
+
+
+def fmt_m(m):
+    return f"{m / 1000:g}km" if m >= 1000 else f"{m:g}m"
+
+
+def buf_color(i, n):
+    return COLORS[0 if i == 0 else 2 if i == n - 1 else 1]
+
+
+def default_labels(i, bufs):
+    """Legend text: [site, buffer 1, buffer 2, ...] (buffers sorted small -> large)."""
+    if i == 1:
+        return ["Project Site"] + [("Core Zone " if k == 0 else "Buffer Zone ") + fmt_m(m) for k, m in enumerate(bufs)]
+    return ["Transmission Line"] + [f"Transmission Line Buffer {fmt_m(m)}" for m in bufs]
+
+
+def make_layer(g, labels, buf_m, dash):
+    """g: GeoDataFrame (4326); labels = [site, buffer1, ...]. True-distance buffers via UTM, dissolved, GeoJSON out."""
+    u = g.to_crs(g.estimate_utm_crs())
+    one = unary_union(list(u.geometry))
+    gj = lambda geom: json.loads(gpd.GeoSeries([geom], crs=u.crs).to_crs(4326).to_json())
+    return {"name": labels[0], "dash": dash, "site": gj(one),
+            "bufs": [{"m": m, "label": lb, "gj": gj(one.buffer(m))} for m, lb in zip(buf_m, labels[1:])]}
+
+
+def legend_rows(layers):
+    return [r for l in layers for r in [(l["name"], COLORS[0], 2.5, l["dash"])] +
+            [(b["label"], buf_color(i, len(l["bufs"])), 2, l["dash"]) for i, b in enumerate(l["bufs"])]]
 
 
 # =====================================================================================
@@ -102,12 +177,29 @@ def mosaic(asset_id, bounds, max_tiles, on_tile=None):
     canvas = Image.new("RGBA", ((x1 - x0 + 1) * 256, (y1 - y0 + 1) * 256), (0, 0, 0, 0))
     tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
-    def load(xy):
-        data = rd.get(z, *xy)
-        if not data:
-            return xy, None
-        t = Image.open(io.BytesIO(data)).convert("RGBA")
-        return xy, (t if t.size == (256, 256) else t.resize((256, 256), Image.Resampling.BILINEAR))
+    def read(zl, x, y):  # retry transient read/decode errors
+        for a in range(3):
+            try:
+                data = rd.get(zl, x, y)
+                if not data:
+                    return None
+                t = Image.open(io.BytesIO(data)).convert("RGBA")
+                return t if t.size == (256, 256) else t.resize((256, 256), Image.Resampling.BILINEAR)
+            except Exception as e:
+                print(f"TILE ERROR {asset_id} z{zl} {(x, y)} try {a + 1}: {e!r}", flush=True)
+                time.sleep(.3 * (a + 1))
+
+    def load(xy):  # missing/unreadable tile -> upscale parent tile (up to 3 zooms up)
+        x, y = xy
+        for s in range(min(3, z - h["min_zoom"]) + 1):
+            t = read(z - s, x >> s, y >> s)
+            if t is not None:
+                if s:
+                    q, m = 256 >> s, (1 << s) - 1
+                    cx0, cy0 = (x & m) * q, (y & m) * q
+                    t = t.crop((cx0, cy0, cx0 + q, cy0 + q)).resize((256, 256), Image.Resampling.BICUBIC)
+                return xy, t
+        return xy, None
 
     with ThreadPoolExecutor(max_workers=TILE_WORKERS) as ex:
         for i, (xy, t) in enumerate(ex.map(load, tiles), 1):
@@ -225,7 +317,7 @@ def paste_mosaic(map_img, canvas, ext, ox, oy, scale, mx0, my0):
         map_img.paste(part, (tx0, ty0), part)
 
 
-def export_map(sheets_pm, site, title, sheets_str, dpi, legend_bytes, progress, out_path):
+def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress, out_path):
     pt = lambda v: max(1, int(round(v * dpi / 72)))
     W, H = int(16 * dpi), int(11 * dpi)
     mx0, mx1, my0, my1 = int(.05 * W), int(.745 * W), int(.06 * H), int(.93 * H)
@@ -234,11 +326,12 @@ def export_map(sheets_pm, site, title, sheets_str, dpi, legend_bytes, progress, 
 
     # ---- view extent (fit to map box; the box is always fully covered by the requested bbox) ----
     progress(0.01, "Preparing extent...")
-    bufs = s = None
-    if site is not None:
-        s = site.to_crs(3857)
-        bufs = {km: s.buffer(km * 1000) for km in (10, 5, 2)}
-        b = bufs[10].total_bounds
+    to_m = lambda gj: gpd.GeoDataFrame.from_features(gj["features"], crs=4326).to_crs(3857).geometry
+    for l in layers:
+        l["site"], l["bufs"] = to_m(l["site"]), [dict(b, gj=to_m(b["gj"])) for b in l["bufs"]]
+    if layers:
+        bs = [g.total_bounds for l in layers for g in [l["site"]] + [b["gj"] for b in l["bufs"]]]
+        b = [min(v[0] for v in bs), min(v[1] for v in bs), max(v[2] for v in bs), max(v[3] for v in bs)]
         dx, dy = (b[2] - b[0]) * .15, (b[3] - b[1]) * .15
         vx0, vx1, vy0, vy1 = b[0] - dx, b[2] + dx, b[1] - dy, b[3] + dy
     else:
@@ -263,18 +356,25 @@ def export_map(sheets_pm, site, title, sheets_str, dpi, legend_bytes, progress, 
     n = max(len(sheets_pm), 1)
     max_tiles = min(16, math.ceil(max(mw, mh) / 256))  # ~1 source tile per 256 output px, capped for memory/time
 
-    # ---- tiles ----
+    # ---- tiles (a failing sheet is skipped, the rest continue) ----
     map_img = Image.new("RGB", (mw, mh), "white")
+    skipped = []
     for i, aid in enumerate(sheets_pm):
-        res = mosaic(aid, bbox, max_tiles,
-                     lambda dn, t, idx=i: progress((idx + dn / t) / n * 0.75,
-                                                   f"Fetching tiles: sheet {idx + 1}/{n} ({dn}/{t})"))
-        if res:
-            paste_mosaic(map_img, res[0], res[1], ox, oy, scale, mx0, my0)
-            del res
-            gc.collect()
+        try:
+            res = mosaic(aid, bbox, max_tiles,
+                         lambda dn, t, idx=i: progress((idx + dn / t) / n * 0.75,
+                                                       f"Fetching tiles: sheet {idx + 1}/{n} ({dn}/{t})"))
+            if res:
+                paste_mosaic(map_img, res[0], res[1], ox, oy, scale, mx0, my0)
+                del res
+        except Exception as e:
+            skipped.append(os.path.basename(aid))
+            print(f"SKIPPED SHEET {aid}: {e!r}", flush=True)
+        gc.collect()
+    if sheets_pm and len(skipped) == len(sheets_pm):
+        raise RuntimeError("None of the selected sheets could be loaded: " + ", ".join(skipped))
 
-    # ---- overlay: graticule, site, buffers ----
+    # ---- overlay: graticule, vectors, buffers ----
     progress(0.8, "Drawing map overlay and legend...")
     md = ImageDraw.Draw(map_img)
     tp = lambda x, y: (ox + x * scale - mx0, oy - y * scale - my0)
@@ -294,9 +394,9 @@ def export_map(sheets_pm, site, title, sheets_str, dpi, legend_bytes, progress, 
                 draw_path(md, [(0, p), (mw, p)], gcol, 1, gdash)
                 ylabels.append((p + my0, f"{v:.{dec}f}°"))
 
-    if site is not None:
-        for geoms, c, dash, lw in ((bufs[10], BUF10_COLOR, None, 2.0), (bufs[5], "#000", (pt(6), pt(4)), 1.5),
-                                   (bufs[2], "#000", (pt(1.5), pt(3)), 1.8), (s.geometry, "#000", None, 2.0)):
+    for l in layers:
+        dash, n_ = ((pt(6), pt(4)) if l["dash"] else None), len(l["bufs"])
+        for geoms, c, lw in [(b["gj"], buf_color(i, n_), 2) for i, b in enumerate(l["bufs"])] + [(l["site"], COLORS[0], 2.5)]:
             for g in geoms:
                 for path in geom_paths(g):
                     draw_path(md, [tp(x, y) for x, y in path], c, pt(lw), dash)
@@ -333,7 +433,9 @@ def export_map(sheets_pm, site, title, sheets_str, dpi, legend_bytes, progress, 
     ax_, ay_, hh, ww = PX(.8), PY(.925), pt(9), pt(7)
     d.polygon([(ax_, ay_ - hh), (ax_ - ww, ay_ + hh), (ax_ + ww, ay_ + hh)], fill="black")
 
-    for v in (.905, .74, .545):
+    rows = legend_rows(layers)
+    sep = min(.545, .672 - .024 * len(rows) + .016)  # divider below the legend rows
+    for v in (.905, .74, sep):
         d.line([(px0, PY(v)), (px1, PY(v))], fill="black", width=pt(1))
     put_text(d, (PX(.5), PY(.88)), "Title :", get_font(pt(11.5), True), "mm")
 
@@ -345,35 +447,34 @@ def export_map(sheets_pm, site, title, sheets_str, dpi, legend_bytes, progress, 
         d.multiline_text((px0 + pw * .03, PY(.895)), t_txt, font=f_t, fill="black", align="center", spacing=sp)
 
     put_text(d, (PX(.5), PY(.715)), "Legends", get_font(pt(10.5), True), "mm")
-    f_leg = get_font(pt(8.5))
-    for y, lab, dash, lw, c in ((.672, "Project Site", None, 1.8, "black"),
-                                (.637, "Core Zone : 2 km", (pt(1.5), pt(3)), 1.8, "black"),
-                                (.602, "Buffer Zone 5 km", (pt(6), pt(4)), 1.5, "black"),
-                                (.567, "Buffer Zone 10 km", None, 2.0, BUF10_COLOR)):
-        x0_, x1_, y0_, y1_ = PX(.08), PX(.20), PY(y + .022), PY(y)
-        draw_path(d, [(x0_, y0_), (x1_, y0_), (x1_, y1_), (x0_, y1_), (x0_, y0_)], c, pt(lw), dash)
-        put_text(d, (PX(.25), PY(y + .011)), lab, f_leg, "lm")
+    f_leg, y = get_font(pt(8)), .672
+    for lab, c, lw, dashed in rows:
+        x0_, x1_, y0_, y1_ = PX(.08), PX(.20), PY(y + .016), PY(y)
+        draw_path(d, [(x0_, y0_), (x1_, y0_), (x1_, y1_), (x0_, y1_), (x0_, y0_)], c, pt(lw), (pt(6), pt(4)) if dashed else None)
+        put_text(d, (PX(.25), PY(y + .008)), lab, f_leg, "lm")
+        y -= .024
 
     if legend_bytes:  # conventional symbols: stretched to fill the box
         try:
             li = Image.open(io.BytesIO(legend_bytes)).convert("RGBA")
-            x0_, y0_, x1_, y1_ = int(PX(.005)), int(PY(.54)), int(PX(.995)), int(PY(.005))
+            x0_, y0_, x1_, y1_ = int(PX(.005)), int(PY(sep - .005)), int(PX(.995)), int(PY(.005))
             li = li.resize((x1_ - x0_, y1_ - y0_), Image.Resampling.LANCZOS)
             img.paste(li, (x0_, y0_), li)
             del li
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"LEGEND ERROR: {e!r}", flush=True)
 
     f_ft = get_font(pt(12), True)
     put_text(d, (.15 * W, .975 * H), "Source : Survey of India", f_ft, "lm")
     put_text(d, (.42 * W, .975 * H), f"Topo sheet No. {sheets_str}", f_ft, "lm")
 
-    progress(0.9, f"Encoding PNG at {dpi} DPI...")
+    progress(0.9, f"Encoding PNG at {dpi} DPI..." + (f" (skipped: {', '.join(skipped)})" if skipped else ""))
     tmp = out_path + ".tmp"
     img.save(tmp, format="PNG", compress_level=3, dpi=(dpi, dpi))
     del img
     gc.collect()
     os.replace(tmp, out_path)
+    return skipped
 
 
 def worker_main(job_dir):
@@ -385,17 +486,16 @@ def worker_main(job_dir):
 
     with open(os.path.join(job_dir, "input.json"), encoding="utf-8") as f:
         cfg = json.load(f)
-    site = None
-    if os.path.exists(os.path.join(job_dir, "site.geojson")):
-        site = gpd.read_file(os.path.join(job_dir, "site.geojson"))
-        site = site.set_crs(4326) if site.crs is None else site.to_crs(4326)
     legend = None
     if os.path.exists(os.path.join(job_dir, "legend.png")):
         with open(os.path.join(job_dir, "legend.png"), "rb") as f:
             legend = f.read()
     progress(0.0, "Starting export process...")
-    export_map(cfg["sheets_pm"], site, cfg["title"], cfg["sheets_str"], cfg["dpi"], legend,
-               progress, os.path.join(job_dir, "result.png"))
+    skipped = export_map(cfg["sheets_pm"], cfg["layers"], cfg["title"], cfg["sheets_str"], cfg["dpi"], legend,
+                         progress, os.path.join(job_dir, "result.png"))
+    if skipped:
+        with open(os.path.join(job_dir, "warn.txt"), "w") as f:
+            f.write(", ".join(skipped))
 
 
 if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--export":
@@ -412,7 +512,7 @@ import streamlit.components.v1 as components
 
 if not TOKEN:
     try:
-        TOKEN = st.secrets.get("GITHUB_TOKEN")
+        TOKEN = st.secrets.get("HF_TOKEN")
     except Exception:
         TOKEN = None
     if TOKEN:
@@ -440,10 +540,14 @@ hr{margin:.4rem 0!important}
 
 @st.cache_data(ttl=300)
 def release_assets():
-    r = session.get(f"{API}/releases/tags/{RELEASE_TAG}",
-                    headers={"Accept": "application/vnd.github+json"}, timeout=30)
-    r.raise_for_status()
-    return {a["name"]: str(a["id"]) for a in r.json()["assets"]}
+    """{file name: repo path} for every file in the HF dataset (paginated, recursive)."""
+    out, url = {}, HF_TREE
+    while url:
+        r = session.get(url, timeout=30)
+        r.raise_for_status()
+        out.update({os.path.basename(f["path"]): f["path"] for f in r.json() if f.get("type") == "file"})
+        url = r.links.get("next", {}).get("url")
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -465,7 +569,7 @@ class Proxy(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            code, cr, body = fetch_range(self.path.strip("/").split("/")[-1], self.headers.get("Range"))
+            code, cr, body = fetch_range(unquote(self.path.split("?")[0].lstrip("/")), self.headers.get("Range"))
             self.send_response(code)
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Accept-Ranges", "bytes")
@@ -473,7 +577,8 @@ class Proxy(BaseHTTPRequestHandler):
             if cr:
                 self.send_header("Content-Range", cr)
             self._cors(); self.end_headers(); self.wfile.write(body)
-        except Exception:
+        except Exception as e:  # only this file fails; other sheets keep working
+            print("PROXY ERROR:", self.path, repr(e), flush=True)
             try:
                 self.send_response(500); self._cors(); self.end_headers()
             except Exception:
@@ -485,9 +590,13 @@ class Proxy(BaseHTTPRequestHandler):
 
 @st.cache_resource
 def start_proxy():
-    srv = ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), Proxy)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), Proxy)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv
+    except OSError as e:  # e.g. port already in use: the map falls back to direct Hugging Face URLs
+        print(f"PROXY START ERROR (port {PROXY_PORT}): {e!r}", flush=True)
+        return None
 
 
 start_proxy()
@@ -508,8 +617,8 @@ def legend_image(assets):
             code, _, body = fetch_range(assets[key], None)
             if code == 200:
                 return body
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"LEGEND FETCH ERROR: {e!r}", flush=True)
     for path in ["legend_toposheet.png", "assets/legend_toposheet.png"]:
         if os.path.exists(path):
             with open(path, "rb") as f:
@@ -519,15 +628,15 @@ def legend_image(assets):
 
 @st.cache_data
 def load_osm_index():
-    paths = ["OSM_SHEET_INDEX.shp", "assets/OSM_SHEET_INDEX.shp", "assets/OSM_SHEET_INDEX/OSM_SHEET_INDEX.shp"]
-    target = next((p for p in paths if os.path.exists(p)), None)
-    if target:
-        try:
-            gdf = gpd.read_file(target)
-            return gdf.set_crs(4326) if gdf.crs is None else gdf.to_crs(4326)
-        except Exception as e:
-            st.sidebar.warning(f"Could not load OSM_SHEET_INDEX.shp: {e}")
-    return None
+    a = release_assets()
+    if "OSM_SHEET_INDEX.shp" not in a:
+        raise FileNotFoundError("OSM_SHEET_INDEX.shp not found in the HF repo listing")
+    for ext in ("shx", "dbf", "prj", "cpg"):  # sidecars must sit next to the .shp
+        if f"OSM_SHEET_INDEX.{ext}" in a:
+            local_file(a[f"OSM_SHEET_INDEX.{ext}"])
+    os.environ["SHAPE_RESTORE_SHX"] = "YES"
+    g = gpd.read_file(local_file(a["OSM_SHEET_INDEX.shp"]))
+    return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
 
 
 def load_vector(f):
@@ -565,17 +674,14 @@ def describe_exit(rc):
     return f"{known[code]} [0x{code:08X}]" if code in known else f"exit code {rc}"
 
 
-def start_export(sheets_pm, site, title, sheets_str, dpi, legend_bytes):
+def start_export(sheets_pm, layers, title, sheets_str, dpi, legend_bytes):
     d = tempfile.mkdtemp(prefix="topo_export_")
     with open(os.path.join(d, "input.json"), "w", encoding="utf-8") as f:
-        json.dump({"sheets_pm": sheets_pm, "title": title, "sheets_str": sheets_str, "dpi": dpi}, f)
-    if site is not None:
-        with open(os.path.join(d, "site.geojson"), "w", encoding="utf-8") as f:
-            f.write(site.to_json())
+        json.dump({"sheets_pm": sheets_pm, "layers": layers, "title": title, "sheets_str": sheets_str, "dpi": dpi}, f)
     if legend_bytes:
         with open(os.path.join(d, "legend.png"), "wb") as f:
             f.write(legend_bytes)
-    env = dict(os.environ, **({"GITHUB_TOKEN": TOKEN} if TOKEN else {}))
+    env = dict(os.environ, **({"HF_TOKEN": TOKEN} if TOKEN else {}))
     with open(os.path.join(d, "log.txt"), "wb") as log:
         proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--export", d],
                                 env=env, stdout=log, stderr=subprocess.STDOUT,
@@ -602,6 +708,11 @@ def refresh_job(job):
     if rc == 0 and os.path.exists(res):
         with open(res, "rb") as f:
             job["result"] = f.read()
+        try:
+            with open(os.path.join(d, "warn.txt")) as f:
+                job["warn"] = f.read()
+        except Exception:
+            pass
         job.update(status="done", progress=1.0, msg="Done")
     else:
         try:
@@ -629,31 +740,67 @@ assets = {}
 try:
     assets = release_assets()
 except Exception as e:
-    st.sidebar.error(f"GitHub error: {e}")
-pm_assets = {n: i for n, i in assets.items() if n.endswith(".pmtiles")}
+    st.sidebar.error(f"Hugging Face error: {e}")
+pm_assets = {n: i for n, i in assets.items() if n.endswith(".pmtiles") and not i.startswith("contributions/")}
 
 basemap = st.sidebar.selectbox("🗺️ Choose Base Map",
-                               ["OpenStreetMap", "Google Satellite", "Google Hybrid", "Google Roadmap", "Esri Satellite"])
+                               ["OpenStreetMap", "Google Satellite", "Google Hybrid", "Google Roadmap", "Esri Satellite"],
+                               index=1)
 show_topo = st.sidebar.toggle("🗾 Show Topo Layer", value=True)
 show_osm_index = st.sidebar.toggle("📐 Show OSM Sheet Index", value=False)
 chosen = st.sidebar.multiselect("Toposheets (PMTiles)", list(pm_assets))
-vec = st.sidebar.file_uploader("Upload Vector (.geojson, .kml, .zip)", type=["geojson", "kml", "gpx", "zip"])
 
-site = None
-if vec:
+layers, sig = [], []
+for i in (1, 2):
+    vf = st.sidebar.file_uploader(f"Vector {i} (.geojson, .kml, .zip)", type=["geojson", "kml", "gpx", "zip"], key=f"vec{i}")
+    bt = st.sidebar.text_input(f"Vector {i} buffers (e.g. 2km, 5km, 10km)", "2km, 5km, 10km" if i == 1 else "2km", key=f"buf{i}")
+    bm = parse_buffers(bt)
+    dl = default_labels(i, bm)  # key includes bt, so the default refreshes when the buffers change
+    lt = st.sidebar.text_input(f"Vector {i} legend text (comma separated: site, then each buffer)", ", ".join(dl), key=f"lab{i}_{bt}")
+    lab = [x.strip() for x in lt.split(",")]
+    labels = [lab[k] if k < len(lab) and lab[k] else d for k, d in enumerate(dl)]
+    if vf:
+        try:
+            g = load_vector(vf)
+            if g is None:
+                st.sidebar.error("No .shp found inside the zip.")
+            else:
+                layers.append(make_layer(g, labels, bm, i == 2))
+                sig.append(vf.name)
+        except Exception as e:
+            st.sidebar.error(f"Vector {i} error: {e}")
+
+with st.sidebar.expander("🤝 Contribute a toposheet"):
+    cf = st.file_uploader("PMTiles or GeoTIFF (reviewed before it is listed)", type=["pmtiles", "tif", "tiff"], key="contrib")
+    if cf and st.button("Submit contribution"):
+        head = cf.read(8)
+        cf.seek(0)
+        if not (head.startswith(b"PMTiles") if cf.name.lower().endswith(".pmtiles") else head[:2] in (b"II", b"MM")):
+            st.error("Not a valid PMTiles / GeoTIFF file.")
+        else:
+            try:
+                from huggingface_hub import HfApi
+                try:
+                    wt = os.getenv("HF_WRITE_TOKEN") or st.secrets.get("HF_WRITE_TOKEN") or TOKEN
+                except Exception:
+                    wt = TOKEN
+                safe = re.sub(r"[^\w.-]", "_", cf.name)
+                HfApi(token=wt).upload_file(path_or_fileobj=cf, repo_id=HF_REPO, repo_type="dataset",
+                                            path_in_repo=f"contributions/{int(time.time())}_{safe}")
+                st.success("Uploaded to contributions/ - it will be listed once reviewed.")
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+
+osm_gdf = None
+if show_osm_index:
     try:
-        site = load_vector(vec)
-        st.sidebar.caption("✅ Vectors Loaded" if site is not None else "")
-        if site is None:
-            st.sidebar.error("No .shp found inside the zip.")
+        osm_gdf = load_osm_index()
     except Exception as e:
-        st.sidebar.error(f"Vector error: {e}")
+        st.sidebar.error(f"OSM index: {e}")
 
-osm_gdf = load_osm_index() if show_osm_index else None
-
-# Sheet numbers: all selected sheets, or - once a vector is loaded - only those touching the 10 km buffer
-m3857 = site.to_crs(3857) if site is not None else None
-buf_ll = {km: m3857.buffer(km * 1000).to_crs(4326) for km in (10, 5, 2)} if site is not None else None
+# Sheet numbers: all selected sheets, or - once vectors are loaded - only those touching the outermost buffers
+outer = [shape(f["geometry"]) for l in layers
+         for f in (l["bufs"][-1]["gj"] if l["bufs"] else l["site"])["features"]]
 
 
 def touches_buffer(name):
@@ -661,21 +808,20 @@ def touches_buffer(name):
         bx = box(*cached_bounds(pm_assets[name]))
     except Exception:
         return True
-    return any(g.intersects(bx) for g in buf_ll[10])
+    return any(g.intersects(bx) for g in outer)
 
 
-names = [n for n in chosen if site is None or touches_buffer(n)]
+names = [n for n in chosen if not outer or touches_buffer(n)]
 sheets = [s for s in dict.fromkeys(sheet_no(n) for n in names) if s]
-sheets_str = ", ".join(sheets) or ("None within 10 km buffer" if chosen else "56F/12, 56F/8, 56G/5, 56G/9")
+sheets_str = ", ".join(sheets) or ("None within buffers" if chosen else "56F/12, 56F/8, 56G/5, 56G/9")
 
 cfg = {
-    "basemap": basemap, "site": None, "buffers": [], "buf10_color": BUF10_COLOR,
-    "pm": [{"name": n, "url": f"http://127.0.0.1:{PROXY_PORT}/{pm_assets[n]}"} for n in chosen] if show_topo else [],
-    "osm_index": json.loads(osm_gdf.to_json()) if osm_gdf is not None else None,
+    "basemap": basemap, "colors": COLORS, "layers": layers, "sig": "|".join(sig),
+    # url = local proxy (works when the app runs on this machine); alt = direct HF (works when deployed)
+    "pm": [{"name": n, "url": f"http://127.0.0.1:{PROXY_PORT}/{quote(pm_assets[n])}",
+            "alt": f"{HF_BASE}/resolve/main/{quote(pm_assets[n])}"} for n in chosen] if show_topo else [],
+    "osm_index": json.loads(osm_gdf.to_json(default=str)) if osm_gdf is not None else None,
 }
-if site is not None:
-    cfg["site"] = json.loads(site.to_json())
-    cfg["buffers"] = [{"km": km, "gj": json.loads(buf_ll[km].to_json())} for km in (10, 5, 2)]
 
 # ---------------- Page ----------------
 project_title = st.text_input(
@@ -687,7 +833,10 @@ HTML = """
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
-<div id="m" style="height:480px;border:1px solid #ccc"></div>
+<div style="position:relative">
+  <div id="m" style="height:480px;border:1px solid #ccc"></div>
+  <pre id="log" style="display:none;position:absolute;left:6px;bottom:22px;z-index:1000;margin:0;max-width:70%;max-height:110px;overflow:auto;background:rgba(255,255,255,.92);border:1px solid #c00;color:#900;font:10px/1.3 monospace;padding:4px 6px;white-space:pre-wrap"></pre>
+</div>
 <script>
 const C = __CFG__;
 const BASE = {
@@ -697,41 +846,48 @@ const BASE = {
  "Google Roadmap": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
  "Esri Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 };
+const logEl = document.getElementById('log');
+const log = m => { console.error(m); logEl.style.display = 'block'; logEl.textContent += m + '\\n'; };
 
-const map = L.map('m', {preferCanvas: true, zoomSnap: 0.5}).setView([20, 78], 5);
+let keep = null;  // last view of this tab, restored unless the uploaded vectors changed
+try { keep = JSON.parse(sessionStorage.getItem('topoView')); } catch (e) {}
+if (keep && keep.sig !== C.sig) keep = null;
+const map = L.map('m', {preferCanvas: true, zoomSnap: 0.5}).setView(keep ? keep.c : [21, 79], keep ? keep.z : 5.5);  // default ~half of India
+map.on('moveend', () => { try { sessionStorage.setItem('topoView', JSON.stringify({sig: C.sig, c: map.getCenter(), z: map.getZoom()})); } catch (e) {} });
 L.control.scale().addTo(map);
 L.tileLayer(BASE[C.basemap], {maxZoom: 20, attribution: C.basemap}).addTo(map);
-
 map.createPane('topo'); map.getPane('topo').style.zIndex = 300;
 map.createPane('osm_pane'); map.getPane('osm_pane').style.zIndex = 400;
 
-let siteBounds = null;
-if (C.site) {
-  const sty = {10: [C.buf10_color, 2.5, null], 5: ['#333', 2.5, '4,4'], 2: ['#000', 2.5, '2,4']};
-  C.buffers.forEach(b => {
-    const g = L.geoJSON(b.gj, {style: {color: sty[b.km][0], weight: sty[b.km][1], dashArray: sty[b.km][2], fill: false}}).addTo(map);
-    if (b.km == 10) siteBounds = g.getBounds().pad(0.15);
-  });
-  L.geoJSON(C.site, {style: {color: '#000', weight: 3, fill: false}}).addTo(map);
-}
+let all = null;  // bounds of all vectors + buffers
+C.layers.forEach(lay => {
+  const n = lay.bufs.length, dash = lay.dash ? '8,6' : null;
+  const add = (gj, color, w, tip) => {
+    const g = L.geoJSON(gj, {style: {color, weight: w, dashArray: dash, fill: false}}).bindTooltip(tip, {sticky: true}).addTo(map);
+    all = all ? all.extend(g.getBounds()) : g.getBounds();
+  };
+  lay.bufs.forEach((b, i) => add(b.gj, C.colors[i == 0 ? 0 : i == n - 1 ? 2 : 1], 2.5, b.label));
+  add(lay.site, C.colors[0], 3, lay.name);
+});
+
+if (all && !keep) map.fitBounds(all.pad(0.1));
 
 (async () => {
-  let topoBounds = null;
-  let capZoom = 20;
-  for (const p of C.pm) {
-    try {
-      const src = new pmtiles.PMTiles(p.url);
-      const h = await src.getHeader();
-      pmtiles.leafletRasterLayer(src, {
-        pane: 'topo', minZoom: h.minZoom, maxZoom: h.maxZoom, opacity: 0.85, keepBuffer: 4
-      }).addTo(map);
-      capZoom = Math.min(capZoom, h.maxZoom);
-      const b = L.latLngBounds([[h.minLat, h.minLon], [h.maxLat, h.maxLon]]);
-      topoBounds = topoBounds ? topoBounds.extend(b) : b;
-    } catch (e) { console.error("PMTiles error", p.name, e); }
+  for (const p of C.pm) {  // each sheet is independent: local proxy first, then direct HF; failures are logged
+    let ok = false;
+    for (const [label, url] of [['local proxy', p.url], ['Hugging Face direct', p.alt]]) {
+      try {
+        const src = new pmtiles.PMTiles(url);
+        const h = await src.getHeader();
+        const layer = pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxZoom: h.maxZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
+        let warned = false;
+        layer.on('tileerror', e => { if (!warned) { warned = true; log(p.name + ': tile error via ' + label + ' (' + ((e.error && e.error.message) || 'unknown') + ')'); } });
+        if (label !== 'local proxy') log(p.name + ': loaded via ' + label + ' (local proxy unreachable)');
+        ok = true; break;
+      } catch (e) { log(p.name + ': ' + label + ' failed -> ' + (e && e.message || e) + ' [' + url + ']'); }
+    }
+    if (!ok) log(p.name + ': SKIPPED (all sources failed)');
   }
-  if (siteBounds) map.fitBounds(siteBounds, {maxZoom: capZoom});
-  else if (topoBounds && topoBounds.isValid()) map.fitBounds(topoBounds, {maxZoom: capZoom});
 })();
 
 if (C.osm_index) {
@@ -739,7 +895,7 @@ if (C.osm_index) {
     pane: 'osm_pane',
     style: () => ({color: '#ff4400', weight: 1, fill: false, fillOpacity: 0}),
     onEachFeature: function(feature, layer) {
-      const sheetName = feature.properties ? (feature.properties.EVEREST_SH || 'N/A') : 'N/A';
+      const p = feature.properties || {}, sheetName = p.EVEREST_SH || Object.values(p).find(v => typeof v === 'string') || 'N/A';
       layer.bindTooltip(sheetName, {sticky: true, direction: 'auto'});
       layer.on({
         mouseover: e => { e.target.setStyle({color: '#000000', weight: 2.5, fill: false, fillOpacity: 0}); e.target.bringToFront(); },
@@ -762,10 +918,8 @@ with col_leg:
     with st.container(height=480, border=True):
         st.markdown("### **Legends**")
         st.markdown("".join(
-            f'<div class="lg"><i style="border:{w}px {ls} {c}"></i><b>{lab}</b></div>'
-            for lab, ls, w, c in (("Project Site", "solid", 2, "#000"), ("Core Zone 2 km", "dotted", 2, "#000"),
-                                  ("Buffer Zone 5 km", "dashed", 2, "#000"),
-                                  ("Buffer Zone 10 km", "solid", 3, BUF10_COLOR))), unsafe_allow_html=True)
+            f'<div class="lg"><i style="border:{w}px {"dashed" if dash else "solid"} {c}"></i><b>{lab}</b></div>'
+            for lab, c, w, dash in legend_rows(layers)) or "Upload a vector to see its legend.", unsafe_allow_html=True)
         if leg_bytes:
             st.image(leg_bytes, caption="CONVENTIONAL SYMBOLS", width="stretch")
 
@@ -802,8 +956,7 @@ def export_ui():
             if job:
                 JOBS.pop(st.session_state.get("job_id"), None)
             jid = uuid.uuid4().hex
-            JOBS[jid] = start_export([pm_assets[n] for n in chosen], None if site is None else site.copy(),
-                                     project_title, sheets_str, dpi, leg_bytes)
+            JOBS[jid] = start_export([pm_assets[n] for n in chosen], layers, project_title, sheets_str, dpi, leg_bytes)
             st.session_state["job_id"] = jid
             st.session_state["polling"] = True
             st.rerun()
@@ -815,6 +968,8 @@ def export_ui():
             st.caption("You can change basemap / layers while this runs. The export keeps going.")
         elif job["status"] == "done":
             st.success(f"Map ready in {elapsed}s ({job['dpi']} DPI).")
+            if job.get("warn"):
+                st.warning(f"Failed to load (white areas): {job['warn']}. Generate again.")
             st.download_button("⬇️ Download Ready High-Res Map (PNG)", job["result"],
                                file_name="Topographic_Map_HighRes.png", mime="image/png", width="stretch")
         elif job["status"] == "cancelled":

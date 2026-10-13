@@ -6,7 +6,7 @@ Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN env/secret recom
 Each .pmtiles is downloaded once to a local cache; a failing sheet is skipped, never fatal.
 The export runs in a separate worker process ("--export <dir>") so a crash/OOM never kills the app.
 Live map: the browser tries the local proxy first, then falls back to direct Hugging Face URLs
-(needed when deployed, where 127.0.0.1 is the visitor's machine). Every failure is logged on the map.
+(needed when deployed, where 127.0.0.1 is the visitor's machine). Failures go to the browser console.
 """
 import os, re, io, sys, gc, json, math, time, uuid, shutil, zipfile, tempfile, textwrap, threading, subprocess
 import faulthandler
@@ -320,8 +320,8 @@ def paste_mosaic(map_img, canvas, ext, ox, oy, scale, mx0, my0):
 def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress, out_path):
     pt = lambda v: max(1, int(round(v * dpi / 72)))
     W, H = int(16 * dpi), int(11 * dpi)
-    mx0, mx1, my0, my1 = int(.05 * W), int(.745 * W), int(.06 * H), int(.93 * H)
-    px0, px1 = int(.757 * W), int(.99 * W)
+    mx0, mx1, my0, my1 = int(.035 * W), int(.75 * W), int(.055 * H), int(.935 * H)
+    px0, px1 = mx1, int(.995 * W)  # panel touches the map, no gap
     mw, mh, pw, ph = mx1 - mx0, my1 - my0, px1 - px0, my1 - my0
 
     # ---- view extent (fit to map box; the box is always fully covered by the requested bbox) ----
@@ -332,7 +332,7 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     if layers:
         bs = [g.total_bounds for l in layers for g in [l["site"]] + [b["gj"] for b in l["bufs"]]]
         b = [min(v[0] for v in bs), min(v[1] for v in bs), max(v[2] for v in bs), max(v[3] for v in bs)]
-        dx, dy = (b[2] - b[0]) * .15, (b[3] - b[1]) * .15
+        dx, dy = (b[2] - b[0]) * .075, (b[3] - b[1]) * .075
         vx0, vx1, vy0, vy1 = b[0] - dx, b[2] + dx, b[1] - dy, b[3] + dy
     else:
         with ThreadPoolExecutor(max_workers=TILE_WORKERS) as ex:
@@ -421,20 +421,24 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
 
     # true-scale bar (1 real km = 1000 / cos(lat) Mercator metres)
     px_per_km = 1000 * scale / math.cos(math.radians(unmerc(cx, cy)[1]))
-    km = max([0.1] + [c for c in (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50) if c * px_per_km <= pw * .45])
-    bl, bx, by = km * px_per_km, PX(.08), PY(.945)
+    km = max([0.1] + [c for c in (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50) if c * px_per_km <= pw * .65])
+    bl, bx, by = km * px_per_km, PX(.06), PY(.945)
     d.line([(bx, by), (bx + bl, by)], fill="black", width=pt(1.5))
-    f_sb = get_font(pt(8.5), True)
+    f_sb = get_font(pt(10), True)
     for frac, lab in ((0, "0"), (.5, f"{km / 2:g}"), (1, f"{km:g} km")):
         d.line([(bx + bl * frac, by), (bx + bl * frac, by - pt(5))], fill="black", width=pt(1.5))
         put_text(d, (bx + bl * frac, by - pt(7)), lab, f_sb, "ms")
 
-    put_text(d, (PX(.8), PY(.965)), "N", get_font(pt(18), True), "mm")  # north arrow
-    ax_, ay_, hh, ww = PX(.8), PY(.925), pt(9), pt(7)
-    d.polygon([(ax_, ay_ - hh), (ax_ - ww, ay_ + hh), (ax_ + ww, ay_ + hh)], fill="black")
+    # north arrow: split-kite compass (left half black, right half white)
+    put_text(d, (PX(.82), PY(.975)), "N", get_font(pt(22), True), "mm")
+    ax_, ay_, hh, ww = PX(.82), PY(.929), pt(13), pt(10)
+    top, lft, rgt, mid = (ax_, ay_ - hh), (ax_ - ww, ay_ + hh), (ax_ + ww, ay_ + hh), (ax_, ay_ + hh * .45)
+    d.polygon([top, lft, mid], fill="black")
+    d.polygon([top, mid, rgt], fill="white", outline="black", width=pt(1.2))
+    d.line([top, lft, mid, top], fill="black", width=pt(1.2))
 
     rows = legend_rows(layers)
-    sep = min(.545, .672 - .024 * len(rows) + .016)  # divider below the legend rows
+    sep = min(.5, .672 - .03 * len(rows) + .02)  # divider below the legend rows; symbols box = ~half the panel height
     for v in (.905, .74, sep):
         d.line([(px0, PY(v)), (px1, PY(v))], fill="black", width=pt(1))
     put_text(d, (PX(.5), PY(.88)), "Title :", get_font(pt(11.5), True), "mm")
@@ -446,15 +450,15 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     except ValueError:
         d.multiline_text((px0 + pw * .03, PY(.895)), t_txt, font=f_t, fill="black", align="center", spacing=sp)
 
-    put_text(d, (PX(.5), PY(.715)), "Legends", get_font(pt(10.5), True), "mm")
-    f_leg, y = get_font(pt(8)), .672
+    put_text(d, (PX(.5), PY(.715)), "Legends", get_font(pt(13), True), "mm")
+    f_leg, y = get_font(pt(11)), .672
     for lab, c, lw, dashed in rows:
-        x0_, x1_, y0_, y1_ = PX(.08), PX(.20), PY(y + .016), PY(y)
+        x0_, x1_, y0_, y1_ = PX(.06), PX(.19), PY(y + .02), PY(y)
         draw_path(d, [(x0_, y0_), (x1_, y0_), (x1_, y1_), (x0_, y1_), (x0_, y0_)], c, pt(lw), (pt(6), pt(4)) if dashed else None)
-        put_text(d, (PX(.25), PY(y + .008)), lab, f_leg, "lm")
-        y -= .024
+        put_text(d, (PX(.22), PY(y + .01)), lab, f_leg, "lm")
+        y -= .03
 
-    if legend_bytes:  # conventional symbols: stretched to fill the box
+    if legend_bytes:  # conventional symbols: stretched to fill the box (taller, same width)
         try:
             li = Image.open(io.BytesIO(legend_bytes)).convert("RGBA")
             x0_, y0_, x1_, y1_ = int(PX(.005)), int(PY(sep - .005)), int(PX(.995)), int(PY(.005))
@@ -833,10 +837,7 @@ HTML = """
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
-<div style="position:relative">
-  <div id="m" style="height:480px;border:1px solid #ccc"></div>
-  <pre id="log" style="display:none;position:absolute;left:6px;bottom:22px;z-index:1000;margin:0;max-width:70%;max-height:110px;overflow:auto;background:rgba(255,255,255,.92);border:1px solid #c00;color:#900;font:10px/1.3 monospace;padding:4px 6px;white-space:pre-wrap"></pre>
-</div>
+<div id="m" style="height:480px;border:1px solid #ccc"></div>
 <script>
 const C = __CFG__;
 const BASE = {
@@ -846,8 +847,7 @@ const BASE = {
  "Google Roadmap": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
  "Esri Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
 };
-const logEl = document.getElementById('log');
-const log = m => { console.error(m); logEl.style.display = 'block'; logEl.textContent += m + '\\n'; };
+const log = m => console.error(m);
 
 let keep = null;  // last view of this tab, restored unless the uploaded vectors changed
 try { keep = JSON.parse(sessionStorage.getItem('topoView')); } catch (e) {}
@@ -873,7 +873,7 @@ C.layers.forEach(lay => {
 if (all && !keep) map.fitBounds(all.pad(0.1));
 
 (async () => {
-  for (const p of C.pm) {  // each sheet is independent: local proxy first, then direct HF; failures are logged
+  for (const p of C.pm) {  // each sheet is independent: local proxy first, then direct HF; failures go to the console
     let ok = false;
     for (const [label, url] of [['local proxy', p.url], ['Hugging Face direct', p.alt]]) {
       try {
@@ -882,7 +882,6 @@ if (all && !keep) map.fitBounds(all.pad(0.1));
         const layer = pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxZoom: h.maxZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
         let warned = false;
         layer.on('tileerror', e => { if (!warned) { warned = true; log(p.name + ': tile error via ' + label + ' (' + ((e.error && e.error.message) || 'unknown') + ')'); } });
-        if (label !== 'local proxy') log(p.name + ': loaded via ' + label + ' (local proxy unreachable)');
         ok = true; break;
       } catch (e) { log(p.name + ': ' + label + ' failed -> ' + (e && e.message || e) + ' [' + url + ']'); }
     }
@@ -977,6 +976,14 @@ def export_ui():
         elif job["status"] == "error":
             st.error(f"Export failed: {job['error']}")
 
+
+if layers:  # buffers export (site + all buffers of both vectors), above the map export
+    fc = {"type": "FeatureCollection", "features": [
+        dict(f, properties={"layer": l["name"], "label": lb, "buffer_m": m})
+        for l in layers
+        for lb, m, gj in [(l["name"], 0, l["site"])] + [(b["label"], b["m"], b["gj"]) for b in l["bufs"]]
+        for f in gj["features"]]}
+    st.download_button("⬇️ Export buffers (GeoJSON)", json.dumps(fc), "buffers.geojson", "application/geo+json")
 
 export_ui()
 

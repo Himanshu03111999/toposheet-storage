@@ -1172,7 +1172,7 @@ def geo_tiles(cv2, img, M, b, pm_path, prog):
                 level = dict(zip(grp, ex.map(shrink, grp.values())))
             prog(.8 + .15 * (zmax - z) / max(1, zmax - zlo), f"building overview z{z}")
 
-    prog(.96, "writing PMTiles")
+    prog(.96, "writing tiles")
     e7 = lambda v: int(round(v * 1e7))
     with write(pm_path) as w:
         for tid in sorted(tiles):
@@ -1183,6 +1183,56 @@ def geo_tiles(cv2, img, M, b, pm_path, prog):
                    {"name": os.path.basename(pm_path), "format": "webp", "type": "overlay",
                     "minzoom": str(zlo), "maxzoom": str(zmax), "bounds": f"{minx},{miny},{maxx},{maxy}"})
     return zlo, zmax, len(tiles)
+
+
+def save_preview(cv2, img, path):
+    """Small JPEG of the sheet (fallback for the live check)."""
+    k = min(1.0, PREVIEW_PX / max(img.shape[:2]))
+    pv = cv2.resize(img, (max(1, round(img.shape[1] * k)), max(1, round(img.shape[0] * k))), interpolation=cv2.INTER_AREA)
+    Image.fromarray(pv).save(path, "JPEG", quality=82)
+
+
+def tif_read(path):
+    """North-up GeoTIFF in EPSG:4326 -> (RGB uint8 array, (minx, miny, maxx, maxy))."""
+    with ensure("tifffile", "tifffile").TiffFile(path) as t:
+        tg = t.pages[0].tags
+        sc, tie, gk = tg.get(33550), tg.get(33922), tg.get(34735)
+        if sc is None or tie is None:
+            raise RuntimeError("not a georeferenced GeoTIFF (geo tags missing)")
+        v = [int(x) for x in gk.value] if gk else [0, 0, 0, 0]
+        keys = {v[k]: v[k + 3] for k in range(4, 4 + 4 * v[3], 4)}
+        if keys.get(2048) != 4326:
+            raise RuntimeError("GeoTIFF must be in EPSG:4326 (WGS84 lat/lon)")
+        dx, dy = float(sc.value[0]), float(sc.value[1])
+        i, j, _, x0, y0, _ = [float(x) for x in tie.value[:6]]
+        a = t.asarray()
+    if a.ndim == 2:
+        a = np.dstack([a] * 3)
+    elif a.shape[0] in (3, 4) and a.shape[-1] not in (3, 4):
+        a = np.moveaxis(a, 0, -1)
+    a = a[..., :3]
+    if a.dtype != np.uint8:
+        a = (a >> 8).astype(np.uint8) if a.dtype == np.uint16 else \
+            (a.astype(np.float32) * 255 / max(float(a.max()), 1)).astype(np.uint8)
+    h, w = a.shape[:2]
+    minx, maxy = x0 - i * dx, y0 + j * dy
+    if keys.get(1025) == 2:  # PixelIsPoint -> shift half a pixel
+        minx, maxy = minx - dx / 2, maxy + dy / 2
+    return np.ascontiguousarray(a), (minx, maxy - h * dy, minx + w * dx, maxy)
+
+
+def tif_one(cv2, path, name, out_dir, prog):
+    """GeoTIFF already georeferenced: only cut the tile pyramid (PMTiles)."""
+    prog(.05, "reading GeoTIFF")
+    img, b = tif_read(path)
+    minx, miny, maxx, maxy = b
+    h, w = img.shape[:2]
+    M = np.array([[w / (maxx - minx), 0], [0, -h / (maxy - miny)], [-minx * w / (maxx - minx), maxy * h / (maxy - miny)]], float)
+    save_preview(cv2, img, os.path.join(out_dir, name + ".jpg"))
+    pm = os.path.join(out_dir, name + ".pmtiles")
+    zlo, zmax, nt = geo_tiles(cv2, img, M, b, pm, lambda fr, m: prog(.1 + .88 * fr, m))
+    return {"name": name, "pb": [[miny, minx], [maxy, maxx]], "zoom": [zlo, zmax], "tiles": nt,
+            "tif_mb": None, "pm_mb": round(os.path.getsize(pm) / 1e6, 1)}
 
 
 def georef_one(cv2, pdf_path, name, b, out_dir, dpi, prog):
@@ -1200,10 +1250,8 @@ def georef_one(cv2, pdf_path, name, b, out_dir, dpi, prog):
     prog(.15, "writing GeoTIFF")
     tif, pm = os.path.join(out_dir, name + ".tif"), os.path.join(out_dir, name + ".pmtiles")
     out, msk = geo_tif(cv2, img, M, b, tif)
-    k = min(1.0, PREVIEW_PX / max(out.shape[:2]))  # small JPEG of the georeferenced sheet for the live check
-    pv = cv2.resize(out, (max(1, round(out.shape[1] * k)), max(1, round(out.shape[0] * k))), interpolation=cv2.INTER_AREA)
-    Image.fromarray(pv).save(os.path.join(out_dir, name + ".jpg"), "JPEG", quality=82)
-    del out, msk, pv
+    save_preview(cv2, out, os.path.join(out_dir, name + ".jpg"))
+    del out, msk
     prog(.25, "cutting tiles")
     zlo, zmax, nt = geo_tiles(cv2, img, M, b, pm, lambda fr, m: prog(.25 + .73 * fr, m))
     return {"name": name, "pb": [[miny, minx], [maxy, maxx]], "zoom": [zlo, zmax], "tiles": nt,
@@ -1219,8 +1267,9 @@ def georef_main(job_dir):
     for i, it in enumerate(items):
         lo, span = i / len(items), 1 / len(items)
         try:
-            results.append(georef_one(cv2, os.path.join(job_dir, it["file"]), it["name"], it["bounds"], job_dir, cfg["dpi"],
-                                      lambda fr, m, lo=lo, span=span, nm=it["name"]: progress(lo + span * fr, f"{nm}: {m}")))
+            p, cb = os.path.join(job_dir, it["file"]), lambda fr, m, lo=lo, span=span, nm=it["name"]: progress(lo + span * fr, f"{nm}: {m}")
+            results.append(tif_one(cv2, p, it["name"], job_dir, cb) if it["file"].endswith(".tif")
+                           else georef_one(cv2, p, it["name"], it["bounds"], job_dir, cfg["dpi"], cb))
         except Exception as e:
             results.append({"name": it["name"], "error": f"{type(e).__name__}: {e}"})
         gc.collect()
@@ -1599,9 +1648,9 @@ def refresh_job(job):
 def start_georef(items, dpi):
     d = tempfile.mkdtemp(prefix="topo_georef_")
     for i, it in enumerate(items):
-        with open(os.path.join(d, f"in_{i}.pdf"), "wb") as f:
+        it["file"] = f"in_{i}{it.pop('ext', '.pdf')}"
+        with open(os.path.join(d, it["file"]), "wb") as f:
             f.write(it.pop("data"))
-        it["file"] = f"in_{i}.pdf"
     with open(os.path.join(d, "input.json"), "w", encoding="utf-8") as f:
         json.dump({"dpi": dpi, "items": items}, f)
     return new_job("--georef", d, "Starting...", results=[], push=None, skipped=[])
@@ -1612,7 +1661,7 @@ def _geo_done(job):
     with open(os.path.join(d, "results.json"), encoding="utf-8") as f:
         job["results"] = json.load(f)
     for x in os.listdir(d):  # source PDFs are no longer needed
-        if x.startswith("in_") and x.endswith(".pdf"):
+        if x.startswith("in_") and x.endswith((".pdf", ".tif")):
             os.remove(os.path.join(d, x))
 
 
@@ -1765,48 +1814,49 @@ gjob = GEO.get(st.session_state.get("geo_id"))
 refresh_geo(gjob)
 geo_busy = bool(gjob) and (gjob["status"] == "running" or (gjob.get("push") or {}).get("status") == "running")
 
-if st.sidebar.toggle("🧭 Georeference toposheet PDFs", value=False, key="do_geo"):
-    geo_files = st.sidebar.file_uploader("Toposheet PDF(s)", type=["pdf"], accept_multiple_files=True,
+if st.sidebar.toggle("🧭 Add toposheets (PDF or GeoTIFF)", value=False, key="do_geo"):
+    geo_files = st.sidebar.file_uploader("Toposheet PDF(s) or GeoTIFF(s)", type=["pdf", "tif", "tiff"], accept_multiple_files=True,
                                          key="geo_pdfs", disabled=geo_busy)
-    if st.sidebar.button("▶️ Start georeferencing", width="stretch", disabled=geo_busy or not geo_files, key="geo_start"):
+    if st.sidebar.button("▶️ Start", width="stretch", disabled=geo_busy or not geo_files, key="geo_start"):
         try:
             tbl = osm_sheet_table(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
         except Exception as e:
-            tbl = None
+            tbl = {}
             st.sidebar.error(f"Sheet index: {e}")
-        if tbl:
-            items, bad, have, seen = [], [], [], set()
-            for f in geo_files:
-                hit = match_sheet(f.name, tbl)
-                stem = re.sub(r"[^\w.-]", "_", os.path.splitext(f.name)[0])
-                if not hit:
-                    bad.append(f.name)
-                elif stem + ".pmtiles" in pm_assets or stem in seen:  # already in the library -> skip, just show it
-                    have.append(stem + ".pmtiles")
-                else:
-                    seen.add(stem)
-                    items.append({"name": stem, "bounds": list(hit[1]), "data": f.getvalue()})
-            if have:
-                st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | set(have))
-            if items:
-                _old = st.session_state.get("geo_id")
-                kill_job(GEO.pop(_old, None))
-                drop_static(_old)
-                gid = uuid.uuid4().hex
-                GEO[gid] = start_georef(items, GEO_DPI)
-                GEO[gid]["skipped"] = bad
-                st.session_state["geo_id"], st.session_state["geo_poll"] = gid, True
-                st.rerun()
-            elif bad:
-                st.sidebar.error("No PDF name matches a sheet: " + ", ".join(bad))
+        items, bad, have, seen = [], [], [], set()
+        for f in geo_files:
+            is_tif = f.name.lower().endswith((".tif", ".tiff"))  # GeoTIFF is already georeferenced: no sheet match needed
+            hit = None if is_tif else match_sheet(f.name, tbl)
+            stem = re.sub(r"[^\w.-]", "_", os.path.splitext(f.name)[0])
+            if not (hit or is_tif):
+                bad.append(f.name)
+            elif stem + ".pmtiles" in pm_assets or stem in seen:  # already in the library -> skip, just show it
+                have.append(stem + ".pmtiles")
             else:
-                st.rerun()
+                seen.add(stem)
+                items.append({"name": stem, "bounds": list(hit[1]) if hit else None, "data": f.getvalue(),
+                              "ext": ".tif" if is_tif else ".pdf"})
+        if have:
+            st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | set(have))
+        if items:
+            _old = st.session_state.get("geo_id")
+            kill_job(GEO.pop(_old, None))
+            drop_static(_old)
+            gid = uuid.uuid4().hex
+            GEO[gid] = start_georef(items, GEO_DPI)
+            GEO[gid]["skipped"] = bad
+            st.session_state["geo_id"], st.session_state["geo_poll"] = gid, True
+            st.rerun()
+        elif bad:
+            st.sidebar.error("No PDF name matches a sheet: " + ", ".join(bad))
+        else:
+            st.rerun()
 
 _pend = st.session_state.get("geo_select", [])  # sheets to switch on once they are in the list
 if any(n in pm_assets for n in _pend):
     st.session_state["chosen"] = sorted(set(st.session_state.get("chosen", [])) | {n for n in _pend if n in pm_assets})
     st.session_state["geo_select"] = [n for n in _pend if n not in pm_assets]
-chosen = st.sidebar.multiselect("Toposheets (PMTiles)", list(pm_assets), key="chosen")
+chosen = st.sidebar.multiselect("Toposheets", list(pm_assets), key="chosen")
 
 layers, sig = [], []
 for i in (1, 2):
@@ -1825,7 +1875,7 @@ for i in (1, 2):
             st.sidebar.error(f"Vector {i} error: {e}")
 
 with st.sidebar.expander("🤝 Contribute files"):
-    cfs = st.file_uploader("Any file: PMTiles, GeoTIFF, vector, PNG, PDF, ...", accept_multiple_files=True, key="contrib")
+    cfs = st.file_uploader("Any file: toposheet, GeoTIFF, vector, PNG, PDF, ...", accept_multiple_files=True, key="contrib")
     if cfs and st.button("Submit contribution"):
         wt = write_token()
         if not wt:
@@ -1941,7 +1991,7 @@ if geo_ov:
         except Exception:
             return None
     if memo(("staticok", st.session_state["geo_id"]), _static_ok) is False:
-        st.sidebar.warning("Live PMTiles preview is off, showing the image preview. " + (
+        st.sidebar.warning("Live tile preview is off, showing the image preview. " + (
             "Set [server] enableStaticServing = true in .streamlit/config.toml and restart Streamlit."
             if not st.get_option("server.enableStaticServing") else
             "Static serving is on but the static/ folder was not there when Streamlit started: restart Streamlit once."))
@@ -2171,10 +2221,10 @@ def geo_ui():
         st.warning(f"{nm}: no matching sheet - skipped.")
     el = int((j["end"] or time.time()) - j["start"])
     if j["status"] == "running":
-        st.progress(min(j["progress"], .99), text=f"Georeferencing: {j['msg']}  |  {el}s  (background - keep working)")
-        return clear_btn("⛔ Cancel georeferencing")
+        st.progress(min(j["progress"], .99), text=f"Processing: {j['msg']}  |  {el}s  (background - keep working)")
+        return clear_btn("⛔ Cancel")
     if j["status"] == "error":
-        st.error(f"Georeferencing failed: {j['error']}")
+        st.error(f"Processing failed: {j['error']}")
         return clear_btn()
     ok = [r for r in j["results"] if "error" not in r]
     for r in j["results"]:
@@ -2188,13 +2238,13 @@ def geo_ui():
         st.rerun()
     if not ok:
         return clear_btn()
-    st.markdown("### 🧭 Georeferenced sheets")
+    st.markdown("### 🧭 New sheets")
     st.caption(f"Done in {el}s. Check that they line up on the map, then download or add them to the library.")
     st.markdown("| Sheet | Zoom | Tiles | Size | Already in library |\n|---|---|---|---|---|\n" + "\n".join(
         f"| {r['name']} | {r['zoom'][0]}-{r['zoom'][1]} | {r['tiles']} | {r['pm_mb']} MB | "
         f"{'yes (skipped)' if r['name'] + '.pmtiles' in pm_assets else 'no'} |" for r in ok))
     cols = st.columns(4)
-    for i, r in enumerate(ok):
+    for i, r in enumerate([r for r in ok if r.get("tif_mb")]):  # GeoTIFF download only for georeferenced PDFs
         with open(os.path.join(j["dir"], r["name"] + ".tif"), "rb") as fh:
             cols[i % 4].download_button(f"⬇️ {r['name']} (GeoTIFF, {r['tif_mb']} MB)", fh.read(), file_name=r["name"] + ".tif",
                                         mime="image/tiff", width="stretch", key=f"geo_dl{i}")

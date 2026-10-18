@@ -1,14 +1,11 @@
 """
 Geospatial Site Analysis & Mapping Dashboard - single file, Pillow-only export.
-Run:  streamlit run app.py      (login: LOGIN_USER / LOGIN_PASS below, or env APP_USER / APP_PASS)
+Run:  streamlit run app.py      (login: APP_USER / APP_PASS env or secrets)
 Needs: streamlit, requests, geopandas, shapely>=2, pyproj, pillow>=10.1, pmtiles, numpy, contourpy,
-       mapbox-vector-tile (vector PMTiles), huggingface_hub + hf_xet (uploads) - the last two auto-install when needed.
-Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN env/secret recommended).
-
- * After login a one-time "setting up" screen downloads the data files to the cache folder (D:\\topo_cache by default,
-   override with env TOPO_CACHE); afterwards everything is read from disk -> fast.
- * Roads / drainage are vector PMTiles: only the tiles over the outer buffer are read, decoded, merged and clipped.
- * The PNG export runs in a separate worker process ("--export <dir>") so a crash/OOM never kills the app.
+       mapbox-vector-tile, huggingface_hub + hf_xet (auto-install when needed).
+Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN).
+Live map tiles: set R2_BASE (env or secret), e.g. https://tiles.example.com  -> the browser reads the .pmtiles files from
+Cloudflare R2 (same file names as in HF) and keeps every byte range in its Cache API. Without R2_BASE: local proxy / HF.
 """
 import os as _os
 LOGIN_USER, LOGIN_PASS = _os.getenv("APP_USER", "Kosher"), _os.getenv("APP_PASS", "Himanshugis")
@@ -40,22 +37,22 @@ from pmtiles.reader import Reader
 
 Image.MAX_IMAGE_PIXELS = None
 
-# disk cache: hidden folder "geospatial_dashboard_cache" on D: when it exists (else the system temp folder); module-level (the export worker uses it too)
 CACHE = os.environ.get("TOPO_CACHE") or os.path.join(
     "D:\\" if os.path.isdir("D:\\") else tempfile.gettempdir(), "geospatial_dashboard_cache")
 os.makedirs(CACHE, exist_ok=True)
-try:  # hide the folder in Explorer (Hidden + System attributes, same as Windows' own protected folders)
+try:  # hide the folder in Explorer
     if os.name == "nt":
         import ctypes
         ctypes.windll.kernel32.SetFileAttributesW(CACHE, 0x2 | 0x4)
 except Exception:
     pass
-PRELOAD_TOPO = True  # True: the setup screen also downloads ALL toposheets | False: only roads/water/legend/logo
+PRELOAD_TOPO = True  # True: setup screen also downloads ALL toposheets to the server cache | False: only roads/water/legend/logo
 
 APP_TITLE = "Geospatial Site Analysis & Mapping Dashboard"
 HF_REPO = "himanshuguptta/geotiff-hub"
 HF_BASE = f"https://huggingface.co/datasets/{HF_REPO}"
 HF_TREE = f"https://huggingface.co/api/datasets/{HF_REPO}/tree/main?recursive=true"
+R2_BASE = (os.getenv("R2_BASE") or "").rstrip("/")
 PROXY_PORT, TILE_WORKERS, JOB_TTL = 8765, 12, 1800
 LIST_TTL, WATCH_EVERY = 20, 30
 R = 6378137.0
@@ -77,7 +74,6 @@ ROAD_SRC, ROAD_COL = "Survey of India", "#8b4513"
 WATER_SRC = ("Bhuvan LULC-10k:SIS-DP Phase 2 (2018-23) datasets rectified with current "
              "Google Earth Imagery (2025-26)")
 SAT_SRC = "Google Earth Imagery"
-# drainage layers: key -> (legend text, vector PMTiles name, colour)
 DRAIN = {"canal": ("Canal / Drain", "canal_drain", "#00897b"),
          "lake": ("Lake / Pond", "lake_pond", "#29b6f6"),
          "river": ("River / Stream", "river_stream", "#1f4fd8"),
@@ -262,7 +258,7 @@ def web_img(url, key):
 
 
 def reader(aid, full=False):
-    """PMTiles Reader whose small range reads (header, directories) are memoised -> far fewer requests per tile."""
+    """PMTiles Reader whose small range reads (header, directories) are memoised."""
     @lru_cache(maxsize=256)
     def gb(o, l):
         return fetch_range(aid, f"bytes={o}-{o + l - 1}", full)[2]
@@ -377,7 +373,7 @@ def feat_name(props, fallback):
 
 
 def to_kml(name, feats, color="#000000", width=2):
-    """[(placemark name, geometry[, attribute dict])] -> KML text ('description' -> <description>, rest -> <ExtendedData>)."""
+    """[(placemark name, geometry[, attribute dict])] -> KML text."""
     c = "ff" + color[5:7] + color[3:5] + color[1:3]
     sty = f"<Style><LineStyle><color>{c}</color><width>{width}</width></LineStyle><PolyStyle><fill>0</fill></PolyStyle></Style>"
 
@@ -422,7 +418,7 @@ def tile_range(b, z):
 
 
 def read_vt(path, ou_wkb, kinds):
-    """Vector PMTiles (read from the disk copy) -> tiles over the outer buffer (<= 300) decoded, seams dissolved, clipped -> GeoJSON dict or None."""
+    """Vector PMTiles (disk copy) -> tiles over the outer buffer (<= 300) decoded, seams dissolved, clipped -> GeoJSON dict or None."""
     mvt = ensure("mapbox_vector_tile", "mapbox-vector-tile")
     ou, rd = swkb.loads(ou_wkb), reader(path, True)
     h = rd.header()
@@ -436,7 +432,7 @@ def read_vt(path, ou_wkb, kinds):
     def one(xy):
         x, y = xy
         data = rd.get(z, x, y)
-        if data and data[:2] == b"\x1f\x8b":  # gzip-compressed tile (as stored in the PMTiles file)
+        if data and data[:2] == b"\x1f\x8b":
             data = zlib.decompress(data, 31)
         out = []
         for ly in (mvt.decode(data, y_coord_down=True).values() if data else []):
@@ -450,7 +446,7 @@ def read_vt(path, ou_wkb, kinds):
         parts = [g for r in ex.map(one, [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]) for g in r]
     groups = [[make_valid(g) for g in parts if any(t in g.geom_type for t in tp)]
               for k, tp in (("LineString", ("LineString",)), ("Polygon", ("Polygon",))) if k in kinds]
-    geoms = [unary_union(gr) for gr in groups if gr]  # dissolves the duplicate / split pieces at tile seams
+    geoms = [unary_union(gr) for gr in groups if gr]
     if not geoms:
         return None
     g = clip_geoms(gpd.GeoDataFrame(geometry=geoms, crs=4326), ou, 1e-5, kinds)
@@ -725,7 +721,7 @@ def draw_path(d, pts, color, width, dash=None):
 
 
 def draw_windmill(d, x, y, s, color="black"):
-    """3-blade wind turbine: tower, tapered blades, hub. (x, y) = hub centre, s = blade length (px)."""
+    """3-blade wind turbine. (x, y) = hub centre, s = blade length (px)."""
     w = max(1, int(s * .12))
 
     def blades():
@@ -751,7 +747,7 @@ def draw_fc(md, fc, tp, color, width):
 
 
 def draw_water(map_img, md, water, tp, pt):
-    """Drainage layers: translucent polygon fill in the layer colour (holes respected) + outlines; lines as streams."""
+    """Drainage layers: translucent polygon fill (holes respected) + outlines; lines as streams."""
     for k, fc in (water or {}).items():
         if not fc["features"]:
             continue
@@ -1141,6 +1137,11 @@ if not TOKEN:
         TOKEN = None
     if TOKEN:
         session.headers.update({"Authorization": f"Bearer {TOKEN}"})
+if not R2_BASE:
+    try:
+        R2_BASE = (st.secrets.get("R2_BASE") or "").rstrip("/")
+    except Exception:
+        pass
 
 st.set_page_config(page_title=APP_TITLE, page_icon="🛰️", layout="wide")
 
@@ -1181,8 +1182,7 @@ terrain = st.cache_resource(show_spinner="Loading elevation tiles...", max_entri
 road_data = st.cache_resource(show_spinner="Loading roads...", max_entries=4)(build_roads)
 water_data = st.cache_resource(show_spinner="Loading surface water features...", max_entries=8)(build_water)
 
-# ---------------- one-time setup screen (downloads the data files to the cache folder) ----------------
-
+# ---------------- one-time setup screen (server cache: exports + processing) ----------------
 if not st.session_state.get("ready"):
     st.markdown("""<style>
 header[data-testid="stHeader"],[data-testid="stSidebar"],[data-testid="stSidebarCollapsedControl"]{display:none!important}
@@ -1250,7 +1250,7 @@ header[data-testid="stHeader"],[data-testid="stSidebar"],[data-testid="stSidebar
             st.rerun()
         st.stop()
     _setup_ui(100)
-    time.sleep(1.0)  # let the line finish filling before the dashboard opens
+    time.sleep(1.0)
     st.session_state["ready"] = True
     st.rerun()
 
@@ -1365,7 +1365,7 @@ def find_asset(assets, stem, ext):
 
 
 class Proxy(BaseHTTPRequestHandler):
-    """Local range proxy for the live map: disk cache when present, otherwise the byte range is forwarded to HF."""
+    """Local range proxy for the live map (localhost use): disk cache when present, otherwise forwarded to HF."""
 
     def _cors(self):
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -1386,7 +1386,7 @@ class Proxy(BaseHTTPRequestHandler):
                 self.send_header("Content-Range", cr)
             self._cors(); self.end_headers(); self.wfile.write(body)
         except (ConnectionError, TimeoutError):
-            pass  # the browser cancelled the request (pan / zoom): harmless
+            pass
         except Exception:
             try:
                 self.send_response(500); self._cors(); self.end_headers()
@@ -1404,7 +1404,7 @@ def start_proxy():
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         return srv
     except OSError:
-        return None  # port busy: another copy of the app is already serving it
+        return None
 
 
 start_proxy()
@@ -1718,11 +1718,18 @@ if ou_wkb:
             st.sidebar.error(f"{lab} error: {e}")
 on_dem, on_con, on_rd, on_wt = bool(dem_ov), bool(show_con and terr and terr[3]["features"]), bool(road_fc), bool(water)
 
+# live-map sources per sheet: R2 (if configured) -> local proxy -> HF direct; v = file version (browser cache key)
+pmc = lambda n: {"name": n, "v": zlib.crc32(str(_S.sig.get(pm_assets[n])).encode()),
+                 "r2": f"{R2_BASE}/{quote(n)}" if R2_BASE else None,
+                 "url": f"http://127.0.0.1:{PROXY_PORT}/{quote(pm_assets[n])}",
+                 "alt": f"{HF_BASE}/resolve/main/{quote(pm_assets[n])}"}
+warm = [{"r2": p["r2"], "v": p["v"]} for p in map(pmc, pm_assets)] if R2_BASE else []
+
 cfg = {
     "basemap": basemap, "base": BASEMAPS[basemap], "colors": COLORS, "layers": [dict(light(l), fc=site_fc(l)) for l in layers],
     "sig": "|".join(sig),
-    "pm": [{"name": n, "url": f"http://127.0.0.1:{PROXY_PORT}/{quote(pm_assets[n])}",
-            "alt": f"{HF_BASE}/resolve/main/{quote(pm_assets[n])}"} for n in chosen] if show_topo else [],
+    "pm": [pmc(n) for n in chosen] if show_topo else [],
+    "all": warm, "wv": str(zlib.crc32(json.dumps(warm).encode())),
     "osm_index": osm_json,
     "dem": {"url": dem_ov[0], "b": dem_ov[1]} if on_dem else None,
     "contours": terr[3] if on_con else None, "con_labels": terr[5] if on_con else None,
@@ -1799,12 +1806,30 @@ C.layers.forEach(lay => {
 });
 if (all && !keep) map.fitBounds(all.pad(0.1));
 
+// PMTiles source that stores every byte range in the browser Cache API (header, directories, tiles) -> repeat views are instant
+class CSrc {
+  constructor(url, v) { this.url = url; this.v = v; }
+  getKey() { return this.url; }
+  async getBytes(o, l, sig) {
+    const k = this.url + '?v=' + this.v + '&r=' + o + '-' + (o + l - 1);
+    let c = null;
+    try { c = await caches.open('pm1'); const h = await c.match(k); if (h) return {data: await h.arrayBuffer()}; } catch (e) {}
+    const r = await fetch(this.url, {signal: sig, headers: {Range: 'bytes=' + o + '-' + (o + l - 1)}});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const b = await r.arrayBuffer();
+    if (r.status === 200 && b.byteLength !== l) throw new Error('server ignored Range');
+    try { if (c) await c.put(k, new Response(b.slice(0))); } catch (e) {}
+    return {data: b};
+  }
+}
+
 (async () => {
-  for (const p of C.pm) {  // each sheet is independent: local proxy first, then direct HF
+  for (const p of C.pm) {  // each sheet is independent: R2, then local proxy, then direct HF
     let ok = false;
-    for (const [label, url] of [['local proxy', p.url], ['Hugging Face direct', p.alt]]) {
+    for (const [label, url] of [['R2', p.r2], ['local proxy', p.url], ['Hugging Face direct', p.alt]]) {
+      if (!url) continue;
       try {
-        const src = new pmtiles.PMTiles(url);
+        const src = new pmtiles.PMTiles(new CSrc(url, p.v));
         const h = await src.getHeader();
         pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxZoom: h.maxZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
         ok = true; break;
@@ -1813,6 +1838,27 @@ if (all && !keep) map.fitBounds(all.pad(0.1));
     if (!ok) log(p.name + ': SKIPPED (all sources failed)');
   }
 })();
+
+// one-time warm-up (per browser and per data version): header + zoomed-out tiles of every sheet, in the background
+setTimeout(async () => {
+  try { if (!C.all.length || localStorage.getItem('pmWarm') === C.wv) return; } catch (e) { return; }
+  const q = C.all.slice();
+  const run = async () => {
+    for (let p; (p = q.shift());) {
+      try {
+        const s = new pmtiles.PMTiles(new CSrc(p.r2, p.v)), h = await s.getHeader();
+        for (let z = h.minZoom; z <= Math.min(h.minZoom + 2, h.maxZoom); z++) {
+          const n = 2 ** z, cl = v => Math.min(n - 1, Math.max(0, Math.floor(v)));
+          const tx = lo => cl((lo + 180) / 360 * n), ty = la => cl((1 - Math.asinh(Math.tan(la * Math.PI / 180)) / Math.PI) / 2 * n);
+          for (let x = tx(h.minLon); x <= tx(h.maxLon); x++)
+            for (let y = ty(h.maxLat); y <= ty(h.minLat); y++) await s.getZxy(z, x, y);
+        }
+      } catch (e) {}
+    }
+  };
+  await Promise.all([run(), run(), run(), run()]);
+  try { localStorage.setItem('pmWarm', C.wv); } catch (e) {}
+}, 3000);
 
 if (C.osm_index) {
   L.geoJSON(C.osm_index, {

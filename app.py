@@ -1181,8 +1181,24 @@ terrain = st.cache_resource(show_spinner="Loading elevation tiles...", max_entri
 road_data = st.cache_resource(show_spinner="Loading roads...", max_entries=4)(build_roads)
 water_data = st.cache_resource(show_spinner="Loading surface water features...", max_entries=8)(build_water)
 
-# ---------------- one-time setup screen (downloads the data files to the cache folder) ----------------
-if not st.session_state.get("ready"):
+# ---------------- one-time setup screen (prepares the data files in the cache folder) ----------------
+def _setup_paths():
+    return list(dict.fromkeys(
+        p for k, p in release_assets().items()
+        if (k.lower().endswith(".pmtiles") and (PRELOAD_TOPO or is_vec(k))) or "legend" in k.lower()
+        or k.lower().endswith(("logo.jpg", "logo.jpeg")) or k.startswith("OSM_SHEET_INDEX.")))
+
+
+def _needs_setup():
+    if not st.session_state.get("ready"):
+        return True
+    try:  # already set up in this session: still make sure every file is really on disk
+        return any(not cached_path(p) for p in _setup_paths())
+    except Exception:
+        return False
+
+
+if _needs_setup():
     st.markdown("""<style>
 header[data-testid="stHeader"],[data-testid="stSidebar"],[data-testid="stSidebarCollapsedControl"]{display:none!important}
 .stApp{background:radial-gradient(circle at 18% 12%,rgba(0,170,255,.30),transparent 45%),
@@ -1221,18 +1237,15 @@ header[data-testid="stHeader"],[data-testid="stSidebar"],[data-testid="stSidebar
         _prev[0] = pct
 
     _setup_ui(0)
-    failed = True
+    failed, _dl = True, False
     try:
-        _a = release_assets()
-        _paths = list(dict.fromkeys(
-            p for k, p in _a.items()
-            if (k.lower().endswith(".pmtiles") and (PRELOAD_TOPO or is_vec(k))) or "legend" in k.lower()
-            or k.lower().endswith(("logo.jpg", "logo.jpeg")) or k.startswith("OSM_SHEET_INDEX.")))
+        _paths = _setup_paths()
         _missing = lambda: [p for p in _paths if not cached_path(p)]
         for _pass in range(2):  # a second pass retries whatever failed in the first
             _todo = _missing()
             if not _todo:
                 break
+            _dl = True
             with ThreadPoolExecutor(max_workers=4) as _ex:
                 for _f in as_completed([_ex.submit(local_file, p) for p in _todo]):
                     try:
@@ -1249,15 +1262,14 @@ header[data-testid="stHeader"],[data-testid="stSidebar"],[data-testid="stSidebar
             st.rerun()
         st.stop()
     _setup_ui(100)
-    time.sleep(1.0)  # let the line finish filling before the dashboard opens
+    if _dl:
+        time.sleep(1.0)  # let the line finish filling before the dashboard opens
     st.session_state["ready"] = True
     st.rerun()
 
+# ---------------- dashboard header + CSS (runs only after setup is done) ----------------
 st.markdown(f"""
 <style>
-header[data-testid="stHeader"]{{display:none!important}}
-[data-testid="stSidebarCollapseButton"],[data-testid="stSidebarCollapsedControl"],[data-testid="stExpandSidebarButton"]{{display:none!important}}
-section[data-testid="stSidebar"]{{transform:none!important;margin-left:0!important;visibility:visible!important;min-width:21rem!important;width:21rem!important}}
 .block-container{{padding:2.5rem 1.5rem .5rem!important}}
 .big-main-title{{font-size:34px;font-weight:800;line-height:1.25;margin-bottom:.1rem}}
 .sub-title{{color:#666;font-size:13px!important;margin-bottom:.6rem}}
@@ -1269,25 +1281,20 @@ hr{{margin:.4rem 0!important}}
 .custom-footer a{{color:#06c;text-decoration:none}}
 .lg{{display:flex;align-items:center;gap:10px;margin:7px 0}}
 .lg i{{display:inline-block;width:34px;height:14px;box-sizing:border-box;flex:none}}
+@media (min-width:992px){{
+header[data-testid="stHeader"]{{display:none!important}}
+[data-testid="stSidebarCollapseButton"],[data-testid="stSidebarCollapsedControl"],[data-testid="stExpandSidebarButton"]{{display:none!important}}
+section[data-testid="stSidebar"]{{transform:none!important;margin-left:0!important;visibility:visible!important;min-width:21rem!important;width:21rem!important}}
+}}
+@media (max-width:991px){{
+.block-container{{padding:3rem .7rem .5rem!important}}
+.big-main-title{{font-size:22px!important}}
+.sub-title{{font-size:11px!important}}
+}}
 </style>
 <div class="big-main-title">🛰️ {APP_TITLE}</div>
 <div class="sub-title">Site boundaries &amp; buffer zones &middot; Toposheets &middot; DEM &amp; contours &middot; Roads &middot; Surface water &middot; Satellite &mdash; with print-ready map export</div>
 """, unsafe_allow_html=True)
-
-
-def load_vector(name, data):
-    with tempfile.TemporaryDirectory() as d:
-        p = os.path.join(d, os.path.basename(name))
-        with open(p, "wb") as fh:
-            fh.write(data)
-        if name.lower().endswith(".zip"):
-            with zipfile.ZipFile(p) as zf:
-                zf.extractall(d)
-            p = next((os.path.join(r, x) for r, _, fs in os.walk(d) for x in fs if x.lower().endswith(".shp")), None)
-            if not p:
-                return None
-        g = gpd.read_file(p)
-    return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
 
 
 @st.cache_resource(show_spinner="Reading vector and building buffers...", max_entries=6)

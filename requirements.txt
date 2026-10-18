@@ -1,4 +1,4 @@
-streamlit>=1.50.0
+streamlit>=1.50
 requests
 numpy
 pillow>=10.1
@@ -11,3 +11,6 @@ pmtiles
 mapbox-vector-tile
 huggingface_hub
 hf_xet
+opencv-python-headless
+pymupdf
+tifffile

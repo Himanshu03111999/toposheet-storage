@@ -6,6 +6,8 @@ Needs: streamlit, requests, geopandas, shapely>=2, pyproj, pillow>=10.1, pmtiles
 Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN). Every file is read remotely by byte range.
 R2_BASE (env or secret): toposheet .pmtiles are read from Cloudflare R2 first (same file names), then from HF.
 Background workers (separate processes): PNG export ("--export <dir>") and PDF georeferencing ("--georef <dir>").
+Georeferenced previews are served by Streamlit static serving: .streamlit/config.toml -> [server] enableStaticServing = true
+and an (even empty) "static" folder next to app.py (commit static/.gitkeep).
 """
 import os as _os
 LOGIN_USER, LOGIN_PASS = _os.getenv("APP_USER", "Kosher"), _os.getenv("APP_PASS", "Himanshugis")
@@ -49,6 +51,7 @@ R = 6378137.0
 COLORS = ["#000000", "#d00000", "#0057ff"]
 DPI_OPTIONS = [300, 500, 800]
 LOGO_SCALE, LOGO_H_PT = 0.6, 100
+STATIC_GEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "geo")
 
 BASEMAPS = {"White": None,
             "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -1269,11 +1272,11 @@ if not st.session_state.get("auth"):
             st.error("Invalid username or password")
     st.stop()
 
-# ---------------- caches ----------------
+# ---------------- caches (all spinners just say "Loading...") ----------------
 release_assets = st.cache_data(ttl=LIST_TTL, show_spinner=False)(list_assets)
-terrain = st.cache_resource(show_spinner="Loading elevation tiles...", max_entries=3)(build_terrain)
-road_data = st.cache_resource(show_spinner="Loading roads...", max_entries=4)(build_roads)
-water_data = st.cache_resource(show_spinner="Loading surface water features...", max_entries=8)(build_water)
+terrain = st.cache_resource(show_spinner="Loading...", max_entries=3)(build_terrain)
+road_data = st.cache_resource(show_spinner="Loading...", max_entries=4)(build_roads)
+water_data = st.cache_resource(show_spinner="Loading...", max_entries=8)(build_water)
 
 st.markdown(f"""
 <style>
@@ -1314,7 +1317,7 @@ def load_vector(name, data):
     return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
 
 
-@st.cache_resource(show_spinner="Reading vector and building buffers...", max_entries=6)
+@st.cache_resource(show_spinner="Loading...", max_entries=6)
 def layer_for(name, data, bm, labels, dash):
     g = load_vector(name, data)
     if g is None:
@@ -1445,14 +1448,14 @@ def read_osm_index(v):  # v = file version (cache key only) -> GeoDataFrame (EPS
     return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
 
 
-@st.cache_resource(show_spinner="Loading OSM sheet index...", max_entries=1)
+@st.cache_resource(show_spinner="Loading...", max_entries=1)
 def osm_geojson(v):
     g = read_osm_index(v)
     g["geometry"] = g.geometry.simplify(0.0005)
     return json.loads(g.to_json(default=str))
 
 
-@st.cache_resource(show_spinner="Reading OSM sheet index...", max_entries=1)
+@st.cache_resource(show_spinner="Loading...", max_entries=1)
 def osm_sheet_table(v):
     """{CLEAN SHEET NAME: (min_lon, min_lat, max_lon, max_lat)} from the OSM sheet index."""
     g = read_osm_index(v)
@@ -1624,57 +1627,26 @@ def hf_commit(pairs, wt, msg):
                 time.sleep(3 * (attempt + 1))
 
 
-@st.cache_resource
-def tile_server():
-    """127.0.0.1 HTTP server (Range + CORS) that serves finished georeferenced tile files to the live map; returns its port."""
-    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+# ---- live preview of freshly georeferenced sheets: served by Streamlit static serving (works on a deployed server) ----
+def publish_static(gid, j):
+    """Expose the finished .pmtiles files under static/geo/<job id>/ (extension .png on purpose: Streamlit only serves
+    allow-listed extensions, and the PMTiles reader does not care about the name). Hard link, copy as fallback."""
+    d = os.path.join(STATIC_GEO, gid)
+    os.makedirs(d, exist_ok=True)
+    for r in j["results"]:
+        if "error" in r:
+            continue
+        src, dst = os.path.join(j["dir"], r["name"] + ".pmtiles"), os.path.join(d, r["name"] + ".png")
+        if os.path.isfile(src) and not os.path.exists(dst):
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copyfile(src, dst)
 
-    class H(BaseHTTPRequestHandler):
-        def log_message(self, *a):
-            pass
 
-        def _cors(self):
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "Range")
-            self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length")
-
-        def do_OPTIONS(self):
-            self.send_response(204)
-            self._cors()
-            self.end_headers()
-
-        def serve(self, head):
-            parts = self.path.split("?")[0].strip("/").split("/")
-            j = GEO.get(parts[0]) if len(parts) == 2 else None
-            fp = os.path.join(j["dir"], os.path.basename(parts[1])) if j and j["status"] == "done" else ""
-            if not fp.endswith(".pmtiles") or not os.path.isfile(fp):
-                return self.send_error(404)
-            size = os.path.getsize(fp)
-            a, b, code = 0, size - 1, 200
-            m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
-            if m and (m[1] or m[2]):
-                a, code = (int(m[1]), 206) if m[1] else (max(0, size - int(m[2])), 206)
-                if m[1] and m[2]:
-                    b = min(int(m[2]), size - 1)
-            self.send_response(code)
-            self._cors()
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Content-Length", str(max(0, b - a + 1)))
-            if code == 206:
-                self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
-            self.end_headers()
-            if not head:
-                with open(fp, "rb") as f:
-                    f.seek(a)
-                    self.wfile.write(f.read(b - a + 1))
-
-        do_GET = lambda self: self.serve(False)
-        do_HEAD = lambda self: self.serve(True)
-
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return srv.server_address[1]
+def drop_static(gid):
+    if gid:
+        shutil.rmtree(os.path.join(STATIC_GEO, gid), ignore_errors=True)
 
 
 def push_bg(job, pairs, wt):
@@ -1776,6 +1748,7 @@ show_osm_index = st.sidebar.toggle("📐 Show OSM Sheet Index", value=False)
 for _gid, _gj in list(GEO.items()):
     if _gj["status"] != "running" and _gj.get("end") and time.time() - _gj["end"] > GEO_TTL:
         kill_job(_gj)
+        drop_static(_gid)
         GEO.pop(_gid, None)
 gjob = GEO.get(st.session_state.get("geo_id"))
 refresh_geo(gjob)
@@ -1805,7 +1778,9 @@ if st.sidebar.toggle("🧭 Georeference toposheet PDFs", value=False, key="do_ge
             if have:
                 st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | set(have))
             if items:
-                kill_job(GEO.pop(st.session_state.get("geo_id"), None))
+                _old = st.session_state.get("geo_id")
+                kill_job(GEO.pop(_old, None))
+                drop_static(_old)
                 gid = uuid.uuid4().hex
                 GEO[gid] = start_georef(items, GEO_DPI)
                 GEO[gid]["skipped"] = bad
@@ -1929,8 +1904,12 @@ warm = [{"r2": p["r2"], "v": p["v"]} for p in map(pmc, pm_assets)] if R2_BASE el
 
 geo_ov = [r for r in (gjob["results"] if gjob and gjob["status"] == "done" else [])
           if "error" not in r and r["name"] + ".pmtiles" not in pm_assets]  # sheets not in the library yet
-geo_pm = [{"name": r["name"] + ".pmtiles", "v": zlib.crc32(st.session_state["geo_id"].encode()), "r2": None,
-           "alt": f"http://127.0.0.1:{tile_server()}/{st.session_state['geo_id']}/{r['name']}.pmtiles"} for r in geo_ov]
+geo_pm = []
+if geo_ov:  # finished sheets are served by Streamlit static serving -> same origin as the app, works when deployed
+    _gid = st.session_state["geo_id"]
+    publish_static(_gid, gjob)
+    geo_pm = [{"name": r["name"] + ".pmtiles", "v": zlib.crc32(_gid.encode()), "r2": None,
+               "alt": f"/app/static/geo/{_gid}/{r['name']}.png"} for r in geo_ov]
 
 cfg = {
     "basemap": basemap, "base": BASEMAPS[basemap], "colors": COLORS, "layers": [dict(light(l), fc=site_fc(l)) for l in layers],
@@ -1963,6 +1942,8 @@ html,body{margin:0}
 <script>
 const C = __CFG__;
 const log = m => console.error(m);
+// the map lives in an iframe without its own origin: make same-server paths absolute using the app page's origin
+const abs = u => { try { return u && u.startsWith('/') ? window.parent.location.origin + u : u; } catch (e) { return u; } };
 let keep = null;  // last view of this tab, restored unless the uploaded vectors changed
 try { keep = JSON.parse(sessionStorage.getItem('topoView')); } catch (e) {}
 if (keep && keep.sig !== C.sig) keep = null;
@@ -2033,12 +2014,12 @@ class CSrc {
 }
 
 (async () => {
-  for (const p of C.pm) {  // each sheet is independent: R2 first, then direct HF
+  for (const p of C.pm) {  // each sheet is independent: R2 first, then direct HF (or the app's own static files for new sheets)
     let ok = false;
     for (const [label, url] of [['R2', p.r2], ['Hugging Face direct', p.alt]]) {
       if (!url) continue;
       try {
-        const src = new pmtiles.PMTiles(new CSrc(url, p.v));
+        const src = new pmtiles.PMTiles(new CSrc(abs(url), p.v));
         const h = await src.getHeader();
         pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxZoom: h.maxZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
         ok = true; break;
@@ -2125,8 +2106,10 @@ def geo_ui():
         return
 
     def end():
+        gid = st.session_state.pop("geo_id", None)
         kill_job(j)
-        GEO.pop(st.session_state.pop("geo_id", None), None)
+        drop_static(gid)
+        GEO.pop(gid, None)
         st.session_state.pop("geo_poll", None)
 
     def clear_btn(label="🗑️ Clear"):

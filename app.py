@@ -6,7 +6,9 @@ Needs: streamlit, requests, geopandas, shapely>=2, pyproj, pillow>=10.1, pmtiles
 Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN). Every file is read remotely by byte range.
 R2_BASE (env or secret): toposheet .pmtiles are read from Cloudflare R2 first (same file names), then from HF.
 Background workers (separate processes): PNG export ("--export <dir>") and PDF georeferencing ("--georef <dir>").
-A freshly georeferenced sheet is previewed on the live map as an image overlay (no server / static files needed).
+A freshly georeferenced sheet is previewed on the live map straight from its PMTiles file, served by Streamlit static serving
+(.streamlit/config.toml -> [server] enableStaticServing = true; the static/ folder must exist when Streamlit starts).
+If that is not available the map falls back to a JPEG image overlay of the same sheet.
 """
 import os as _os
 LOGIN_USER, LOGIN_PASS = _os.getenv("APP_USER", "Kosher"), _os.getenv("APP_PASS", "Himanshugis")
@@ -50,7 +52,12 @@ R = 6378137.0
 COLORS = ["#000000", "#d00000", "#0057ff"]
 DPI_OPTIONS = [300, 500, 800]
 LOGO_SCALE, LOGO_H_PT = 0.6, 100
-PREVIEW_PX = 3200  # longest side of the georeference preview image
+PREVIEW_PX = 3200  # longest side of the fallback preview image
+STATIC_GEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "geo")
+try:
+    os.makedirs(STATIC_GEO, exist_ok=True)  # Streamlit mounts /app/static only if static/ exists at startup (restart once if it was new)
+except OSError:
+    pass
 
 BASEMAPS = {"White": None,
             "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
@@ -182,6 +189,12 @@ def web_img(url):
 
 def reader(aid):
     """PMTiles Reader reading byte ranges remotely; small reads (header, directories, tiles) are memoised."""
+    if os.path.isfile(aid):  # local .pmtiles (a freshly georeferenced sheet): read straight from disk
+        def gl(o, l):
+            with open(aid, "rb") as f:
+                f.seek(o)
+                return f.read(l)
+        return Reader(gl)
     memo, locks, lk = {}, {}, threading.Lock()
 
     def gb(o, l):  # single-flight: parallel threads asking for the same range (e.g. a leaf directory) fetch it once
@@ -1629,6 +1642,24 @@ def hf_commit(pairs, wt, msg):
                 time.sleep(3 * (attempt + 1))
 
 
+def publish_static(gid, j):
+    """Expose finished .pmtiles under static/geo/<job id>/ (named .png: Streamlit serves allow-listed extensions only)."""
+    d = os.path.join(STATIC_GEO, gid)
+    os.makedirs(d, exist_ok=True)
+    for r in j["results"]:
+        src, dst = os.path.join(j["dir"], r["name"] + ".pmtiles"), os.path.join(d, r["name"] + ".png")
+        if "error" not in r and os.path.isfile(src) and not os.path.exists(dst):
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copyfile(src, dst)
+
+
+def drop_static(gid):
+    if gid:
+        shutil.rmtree(os.path.join(STATIC_GEO, gid), ignore_errors=True)
+
+
 def push_bg(job, pairs, wt):
     """Background thread: upload georeferenced PMTiles to HF while the app stays usable."""
     job["push"] = {"status": "running"}
@@ -1728,6 +1759,7 @@ show_osm_index = st.sidebar.toggle("📐 Show OSM Sheet Index", value=False)
 for _gid, _gj in list(GEO.items()):
     if _gj["status"] != "running" and _gj.get("end") and time.time() - _gj["end"] > GEO_TTL:
         kill_job(_gj)
+        drop_static(_gid)
         GEO.pop(_gid, None)
 gjob = GEO.get(st.session_state.get("geo_id"))
 refresh_geo(gjob)
@@ -1757,7 +1789,9 @@ if st.sidebar.toggle("🧭 Georeference toposheet PDFs", value=False, key="do_ge
             if have:
                 st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | set(have))
             if items:
-                kill_job(GEO.pop(st.session_state.get("geo_id"), None))
+                _old = st.session_state.get("geo_id")
+                kill_job(GEO.pop(_old, None))
+                drop_static(_old)
                 gid = uuid.uuid4().hex
                 GEO[gid] = start_georef(items, GEO_DPI)
                 GEO[gid]["skipped"] = bad
@@ -1891,7 +1925,30 @@ def preview_url(job, name):
     return memo(("geoprev", st.session_state["geo_id"], name), rd)
 
 
-geo_img = [{"url": preview_url(gjob, r["name"]), "b": r["pb"]} for r in geo_ov] if show_topo else []
+geo_local = [os.path.join(gjob["dir"], r["name"] + ".pmtiles") for r in geo_ov]  # exportable before "Add to library"
+_gs = [x for x in (sheet_no(r["name"]) for r in geo_ov) if x]
+if _gs:
+    sheets_str = ", ".join(dict.fromkeys(sheets + _gs))
+if geo_ov:
+    publish_static(st.session_state["geo_id"], gjob)
+    _g0 = geo_ov[0]["name"]
+
+    def _static_ok():  # ask this very server for the first bytes of the file: "PM" = real PMTiles, anything else = not served
+        try:
+            r = requests.get(f"http://127.0.0.1:{st.get_option('server.port')}/app/static/geo/"
+                             f"{st.session_state['geo_id']}/{_g0}.png", headers={"Range": "bytes=0-1"}, timeout=3)
+            return r.content[:2] == b"PM"
+        except Exception:
+            return None
+    if memo(("staticok", st.session_state["geo_id"]), _static_ok) is False:
+        st.sidebar.warning("Live PMTiles preview is off, showing the image preview. " + (
+            "Set [server] enableStaticServing = true in .streamlit/config.toml and restart Streamlit."
+            if not st.get_option("server.enableStaticServing") else
+            "Static serving is on but the static/ folder was not there when Streamlit started: restart Streamlit once."))
+geo_img = [{"name": r["name"], "v": zlib.crc32(st.session_state["geo_id"].encode()), "b": r["pb"],
+            "alt": f"/app/static/geo/{st.session_state['geo_id']}/{r['name']}.png",  # real PMTiles (preferred)
+            "url": preview_url(gjob, r["name"])}  # JPEG fallback
+           for r in geo_ov] if show_topo else []
 
 cfg = {
     "basemap": basemap, "base": BASEMAPS[basemap], "colors": COLORS, "layers": [dict(light(l), fc=site_fc(l)) for l in layers],
@@ -1924,6 +1981,8 @@ html,body{margin:0}
 <script>
 const C = __CFG__;
 const log = m => console.error(m);
+// the map iframe has no origin of its own: make same-server paths absolute with the app page's origin
+const abs = u => { try { return u.startsWith('/') ? window.parent.location.origin + u : u; } catch (e) { return u; } };
 let keep = null;  // last view of this tab, restored unless the uploaded vectors changed
 try { keep = JSON.parse(sessionStorage.getItem('topoView')); } catch (e) {}
 if (keep && keep.sig !== C.sig) keep = null;
@@ -1934,7 +1993,6 @@ if (C.base) L.tileLayer(C.base, {maxZoom: 20, attribution: C.basemap}).addTo(map
 [['topo', 300], ['dem_pane', 310], ['water_pane', 315], ['con_pane', 320], ['conlab_pane', 325], ['road_pane', 330], ['osm_pane', 400]]
   .forEach(([n, z]) => { map.createPane(n).style.zIndex = z; });
 
-(C.geo_img || []).forEach(g => L.imageOverlay(g.url, g.b, {pane: 'topo', opacity: 0.85}).addTo(map));  // just-georeferenced sheets (preview)
 if (C.dem) L.imageOverlay(C.dem.url, C.dem.b, {pane: 'dem_pane', opacity: 0.75}).addTo(map);
 if (C.water) Object.entries(C.water).forEach(([k, fc]) => L.geoJSON(fc, {pane: 'water_pane', interactive: false,
   style: f => f.geometry.type.indexOf('Line') >= 0
@@ -1995,6 +2053,15 @@ class CSrc {
 }
 
 (async () => {
+  for (const g of (C.geo_img || [])) {  // just-georeferenced sheets: real PMTiles first, JPEG image only if that fails
+    try {
+      const src = new pmtiles.PMTiles(new CSrc(abs(g.alt), g.v)), h = await src.getHeader();
+      pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxZoom: h.maxZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
+    } catch (e) {
+      log(g.name + ': PMTiles preview failed (' + (e && e.message || e) + ') -> image preview');
+      L.imageOverlay(g.url, g.b, {pane: 'topo', opacity: 0.85}).addTo(map);
+    }
+  }
   for (const p of C.pm) {  // each sheet is independent: R2 first, then direct HF
     let ok = false;
     for (const [label, url] of [['R2', p.r2], ['Hugging Face direct', p.alt]]) {
@@ -2087,8 +2154,10 @@ def geo_ui():
         return
 
     def end():
+        gid = st.session_state.pop("geo_id", None)
         kill_job(j)
-        GEO.pop(st.session_state.pop("geo_id", None), None)
+        drop_static(gid)
+        GEO.pop(gid, None)
         st.session_state.pop("geo_poll", None)
 
     def clear_btn(label="🗑️ Clear"):
@@ -2162,7 +2231,7 @@ job = JOBS.get(st.session_state.get("job_id"))
 refresh_job(job)
 
 # map types offered = layers currently open (contours are exported together with the DEM only)
-opts = [k for k, ok in (("Toposheet Map", show_topo and chosen), ("DEM - Elevation Map", on_dem),
+opts = [k for k, ok in (("Toposheet Map", show_topo and (chosen or geo_ov)), ("DEM - Elevation Map", on_dem),
                         ("DEM - Contour Map", on_dem and on_con), ("Roads & Transportation Map", on_rd),
                         ("Drainage Map", on_wt), ("Satellite Map", bool(layers))) if ok] or ["Toposheet Map"]
 
@@ -2188,7 +2257,7 @@ def export_ui():
     elif cb.button("🚀 Generate High-Res Map", width="stretch"):
         hd, hc, hr, hw, hs = KINDS[kind]
         topo = not any(KINDS[kind])
-        if topo and not chosen:
+        if topo and not (chosen or geo_ov):
             st.warning("Select at least one toposheet in the sidebar first.")
         elif hs and not layers:
             st.warning("Upload at least one vector first (the satellite map shows the vectors).")
@@ -2201,7 +2270,7 @@ def export_ui():
                      "logo": None if topo else logo_bytes,
                      # toposheet map keeps its white base; satellite map is always Google Satellite; others follow the base map
                      "base": None if topo else SAT_BASE if hs else BASEMAPS[basemap]}
-            JOBS[jid] = start_export([pm_assets[n] for n in chosen] if topo else [], layers, project_title, sheets_str,
+            JOBS[jid] = start_export([pm_assets[n] for n in chosen] + geo_local if topo else [], layers, project_title, sheets_str,
                                      dpi, leg_bytes if topo else None, kind, extra)
             st.session_state["job_id"] = jid
             st.session_state["polling"] = True

@@ -1817,7 +1817,7 @@ geo_busy = bool(gjob) and (gjob["status"] == "running" or (gjob.get("push") or {
 if st.sidebar.toggle("🧭 Add toposheets (PDF or GeoTIFF)", value=False, key="do_geo"):
     geo_files = st.sidebar.file_uploader("Toposheet PDF(s) or GeoTIFF(s)", type=["pdf", "tif", "tiff"], accept_multiple_files=True,
                                          key="geo_pdfs", disabled=geo_busy)
-    if st.sidebar.button("▶️ Start", width="stretch", disabled=geo_busy or not geo_files, key="geo_start"):
+    if st.sidebar.button("▶️ Start Georeferencing", width="stretch", disabled=geo_busy or not geo_files, key="geo_start"):
         try:
             tbl = osm_sheet_table(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
         except Exception as e:

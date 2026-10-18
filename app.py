@@ -1,22 +1,21 @@
 """
-Geospatial Site Analysis & Mapping Dashboard - single file, Pillow-only export.
+Geospatial Site Analysis & Mapping Dashboard - single file, Pillow-only export, no disk cache.
 Run:  streamlit run app.py      (login: APP_USER / APP_PASS env or secrets)
 Needs: streamlit, requests, geopandas, shapely>=2, pyproj, pillow>=10.1, pmtiles, numpy, contourpy,
        mapbox-vector-tile, huggingface_hub + hf_xet (auto-install when needed).
-Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN).
-Live map tiles: set R2_BASE (env or secret), e.g. https://tiles.example.com  -> the browser reads the .pmtiles files from
-Cloudflare R2 (same file names as in HF) and keeps every byte range in its Cache API. Without R2_BASE: local proxy / HF.
+Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN). Every file is read remotely by byte range.
+R2_BASE (env or secret): toposheet .pmtiles are read from Cloudflare R2 first (same file names), then from HF.
+The browser keeps live-map ranges in its Cache API. PNG export runs in a separate worker process ("--export <dir>").
 """
 import os as _os
 LOGIN_USER, LOGIN_PASS = _os.getenv("APP_USER", "Kosher"), _os.getenv("APP_PASS", "Himanshugis")
 
-import os, re, io, sys, gc, json, math, time, uuid, zlib, base64, shutil, zipfile, tempfile, textwrap, threading, \
-    subprocess, types, hmac, importlib, faulthandler
+import os, re, io, sys, gc, json, math, time, uuid, zlib, base64, shutil, zipfile, tempfile, textwrap, \
+    subprocess, types, hmac, importlib, faulthandler, threading
 from functools import lru_cache
-from urllib.parse import quote, unquote
+from urllib.parse import quote
 from xml.sax.saxutils import escape
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from concurrent.futures import ThreadPoolExecutor
 
 try:  # Fix "Cannot find proj.db"
     from pyproj import datadir
@@ -37,23 +36,12 @@ from pmtiles.reader import Reader
 
 Image.MAX_IMAGE_PIXELS = None
 
-CACHE = os.environ.get("TOPO_CACHE") or os.path.join(
-    "D:\\" if os.path.isdir("D:\\") else tempfile.gettempdir(), "geospatial_dashboard_cache")
-os.makedirs(CACHE, exist_ok=True)
-try:  # hide the folder in Explorer
-    if os.name == "nt":
-        import ctypes
-        ctypes.windll.kernel32.SetFileAttributesW(CACHE, 0x2 | 0x4)
-except Exception:
-    pass
-PRELOAD_TOPO = True  # True: setup screen also downloads ALL toposheets to the server cache | False: only roads/water/legend/logo
-
 APP_TITLE = "Geospatial Site Analysis & Mapping Dashboard"
 HF_REPO = "himanshuguptta/geotiff-hub"
 HF_BASE = f"https://huggingface.co/datasets/{HF_REPO}"
 HF_TREE = f"https://huggingface.co/api/datasets/{HF_REPO}/tree/main?recursive=true"
 R2_BASE = (os.getenv("R2_BASE") or "").rstrip("/")
-PROXY_PORT, TILE_WORKERS, JOB_TTL = 8765, 12, 1800
+TILE_WORKERS, JOB_TTL = 32, 1800
 LIST_TTL, WATCH_EVERY = 20, 30
 R = 6378137.0
 COLORS = ["#000000", "#d00000", "#0057ff"]
@@ -95,19 +83,19 @@ TOKEN = os.getenv("HF_TOKEN")
 session = requests.Session()
 if TOKEN:
     session.headers.update({"Authorization": f"Bearer {TOKEN}"})
-web = requests.Session()  # other hosts: never sends the HF token
+web = requests.Session()  # other hosts (R2, tile servers): never sends the HF token
 web.headers["User-Agent"] = "Mozilla/5.0 (toposheet-app)"
 for _s in (session, web):
-    _s.mount("https://", HTTPAdapter(pool_connections=8, pool_maxsize=32))
+    _s.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=64))
 
-# shared state (lives in sys.modules so Streamlit reruns never reset locks / signatures)
+# shared state (lives in sys.modules so Streamlit reruns never reset it): sig = file versions, bounds = sheet bounds,
+# r2 = {repo path: False} for files that are not on R2
 _S = sys.modules.get("_topo_state")
 if _S is None:
     _S = sys.modules["_topo_state"] = types.SimpleNamespace()
-for _k, _v in dict(locks={}, bounds={}, sig={}, ok={}, glock=threading.Lock(),
-                   pf=set(), pool=ThreadPoolExecutor(3)).items():
+for _k in ("sig", "bounds", "r2"):
     if not hasattr(_S, _k):
-        setattr(_S, _k, _v)
+        setattr(_S, _k, {})
 
 
 def ensure(mod, pkg):
@@ -137,88 +125,18 @@ def list_assets():
     return out
 
 
-_pth = lambda path: os.path.join(CACHE, path.replace("/", "__"))
-
-
-def _rw(p, txt=None):
-    try:
-        if txt is None:
-            with open(p, encoding="utf-8") as f:
-                return f.read()
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(txt)
-    except OSError:
-        return None
-
-
-def cached_path(path):
-    """Local path of an up-to-date cached copy, else None (a file replaced on HF counts as not cached)."""
-    p, want = _pth(path), _S.sig.get(path)
-    if not os.path.exists(p):
-        return None
-    if want is None or _S.ok.get(path) == want:
-        return p
-    have = _rw(p + ".sig")
-    if have is None:
-        _rw(p + ".sig", want)
-        have = want
-    if have == want:
-        _S.ok[path] = want
-        return p
-    return None
-
-
-def local_file(path):
-    """Download a dataset file once (single-flight, unique temp name, 6 retries), then read it from disk."""
-    p = cached_path(path)
-    if p:
-        return p
-    p = _pth(path)
-    with _S.glock:
-        lk = _S.locks.setdefault(path, threading.Lock())
-    with lk:
-        if cached_path(path):
-            return p
-        want, tmp, last = _S.sig.get(path), f"{p}.{uuid.uuid4().hex}.part", None
-        for attempt in range(6):
-            try:
-                with session.get(f"{HF_BASE}/resolve/main/{quote(path)}", stream=True, timeout=60,
-                                 headers={"Accept-Encoding": "identity"}) as r:
-                    if r.status_code == 429:
-                        time.sleep(min(float(r.headers.get("Retry-After", 5)), 30))
-                    r.raise_for_status()
-                    with open(tmp, "wb") as f:
-                        for c in r.iter_content(1 << 20):
-                            f.write(c)
-                os.replace(tmp, p)
-                if want:
-                    _rw(p + ".sig", want)
-                    _S.ok[path] = want
-                return p
-            except Exception as e:
-                last = e
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-                time.sleep(3 * (attempt + 1))
-        raise last
-
-
-def fetch_range(path, rng=None, full=False):
-    """(status, Content-Range, bytes). From the disk cache when present (full=True downloads first); else straight from HF."""
-    p = local_file(path) if full else cached_path(path)
-    if p:
-        size = os.path.getsize(p)
-        m = re.match(r"bytes=(\d+)-(\d*)", rng or "")
-        with open(p, "rb") as f:
-            if not m:
-                return 200, None, f.read()
-            a = int(m.group(1))
-            b = min(int(m.group(2)) if m.group(2) else size - 1, size - 1)
-            f.seek(a)
-            return 206, f"bytes {a}-{b}/{size}", f.read(max(b - a + 1, 0))
+def fetch_range(path, rng=None):
+    """(status, Content-Range, bytes). .pmtiles: R2 first (when R2_BASE is set and the file is there), else Hugging Face."""
     h = {"Accept-Encoding": "identity", **({"Range": rng} if rng else {})}
+    if R2_BASE and path.lower().endswith(".pmtiles") and _S.r2.get(path, True):
+        try:
+            r = web.get(f"{R2_BASE}/{quote(os.path.basename(path))}", headers=h, timeout=30)
+            if r.status_code in (200, 206):
+                return r.status_code, r.headers.get("Content-Range"), r.content
+            if r.status_code in (403, 404):
+                _S.r2[path] = False  # not on R2 -> HF from now on
+        except Exception:
+            pass
     for a in range(3):
         try:
             r = session.get(f"{HF_BASE}/resolve/main/{quote(path)}", headers=h, timeout=30)
@@ -234,34 +152,43 @@ def fetch_range(path, rng=None, full=False):
     raise RuntimeError(f"Hugging Face rate limit while reading {path}")
 
 
-def web_img(url, key):
-    """Tile from any web host, cached on disk. None on failure."""
-    p = os.path.join(CACHE, f"tile__{key}.png")
-    if not os.path.exists(p):
-        for a in range(3):
-            try:
-                r = web.get(url, timeout=20)
-                if r.status_code == 200:
-                    tmp = f"{p}.{uuid.uuid4().hex}.part"
-                    with open(tmp, "wb") as f:
-                        f.write(r.content)
-                    os.replace(tmp, p)
-                    break
-                if r.status_code in (400, 403, 404):
-                    return None
-            except Exception:
-                pass
-            time.sleep(.5 * (a + 1))
-        else:
-            return None
-    return Image.open(p)
+@lru_cache(maxsize=512)
+def _wb(url):
+    """Bytes of a tile from any web host (memoised in RAM); None = tile does not exist; raises after 3 failed tries."""
+    for a in range(3):
+        try:
+            r = web.get(url, timeout=20)
+            if r.status_code == 200:
+                return r.content
+            if r.status_code in (400, 403, 404):
+                return None
+        except Exception:
+            pass
+        time.sleep(.5 * (a + 1))
+    raise OSError(url)
 
 
-def reader(aid, full=False):
-    """PMTiles Reader whose small range reads (header, directories) are memoised."""
-    @lru_cache(maxsize=256)
-    def gb(o, l):
-        return fetch_range(aid, f"bytes={o}-{o + l - 1}", full)[2]
+def web_img(url):
+    try:
+        b = _wb(url)
+        return Image.open(io.BytesIO(b)) if b else None
+    except Exception:
+        return None
+
+
+def reader(aid):
+    """PMTiles Reader reading byte ranges remotely; small reads (header, directories, tiles) are memoised."""
+    memo, locks, lk = {}, {}, threading.Lock()
+
+    def gb(o, l):  # single-flight: parallel threads asking for the same range (e.g. a leaf directory) fetch it once
+        k = (o, l)
+        if k not in memo:
+            with lk:
+                kl = locks.setdefault(k, threading.Lock())
+            with kl:
+                if k not in memo:
+                    memo[k] = fetch_range(aid, f"bytes={o}-{o + l - 1}")[2]
+        return memo[k]
     return Reader(gb)
 
 
@@ -275,20 +202,6 @@ def sheet_bounds(aid):
         except Exception:
             return None
     return _S.bounds[k]
-
-
-def prefetch(paths):
-    """Background download of selected sheets, so the export finds them on disk."""
-    def bg(p, k):
-        try:
-            local_file(p)
-        except Exception:
-            _S.pf.discard(k)
-    for p in paths:
-        k = (p, _S.sig.get(p))
-        if k not in _S.pf:
-            _S.pf.add(k)
-            _S.pool.submit(bg, p, k)
 
 
 # ---------------- vectors + buffers ----------------
@@ -418,9 +331,9 @@ def tile_range(b, z):
 
 
 def read_vt(path, ou_wkb, kinds):
-    """Vector PMTiles (disk copy) -> tiles over the outer buffer (<= 300) decoded, seams dissolved, clipped -> GeoJSON dict or None."""
+    """Vector PMTiles (remote byte ranges) -> tiles over the outer buffer (<= 300) decoded, seams dissolved, clipped -> GeoJSON dict or None."""
     mvt = ensure("mapbox_vector_tile", "mapbox-vector-tile")
-    ou, rd = swkb.loads(ou_wkb), reader(path, True)
+    ou, rd = swkb.loads(ou_wkb), reader(path)
     h = rd.header()
     z = h["max_zoom"]
     while True:
@@ -482,7 +395,7 @@ def build_terrain(ou_wkb):
         if z <= 8 or max(x1 - x0, y1 - y0) < 12:
             break
         z -= 1
-    res = mosaic((z, z, lambda zz, x, y: web_img(TERRAIN_URL.format(z=zz, x=x, y=y), f"dem_{zz}_{x}_{y}"), None), b, 99)
+    res = mosaic((z, z, lambda zz, x, y: web_img(TERRAIN_URL.format(z=zz, x=x, y=y)), None), b, 99)
     if not res:
         raise RuntimeError("no elevation tiles for this area")
     cv, ext = res
@@ -546,8 +459,8 @@ def dem_rgba(z, g, edges):
 # EXPORT WORKER
 # =====================================================================================
 def pm_src(aid):
-    """Raster PMTiles sheet as a tile source; the file is read from disk (downloaded once if needed)."""
-    rd = reader(aid, True)
+    """Raster PMTiles sheet as a tile source (remote byte ranges)."""
+    rd = reader(aid)
     h = rd.header()
 
     def get(z, x, y):
@@ -557,8 +470,7 @@ def pm_src(aid):
 
 
 def xyz_src(url):
-    k = zlib.crc32(url.encode())
-    return 0, 19, lambda z, x, y: web_img(url.format(z=z, x=x, y=y), f"bm{k}_{z}_{x}_{y}"), None
+    return 0, 19, lambda z, x, y: web_img(url.format(z=z, x=x, y=y)), None
 
 
 def mosaic(src, bounds, max_tiles, on_tile=None):
@@ -891,17 +803,9 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
         sb = sheet_bounds(aid)
         return sb is None or not (sb[2] <= bbox[0] or sb[0] >= bbox[2] or sb[3] <= bbox[1] or sb[1] >= bbox[3])
 
+    with ThreadPoolExecutor(max_workers=16) as exr:  # sheet headers in parallel
+        list(exr.map(sheet_bounds, sheets_pm))
     sheets_pm = [a for a in sheets_pm if overlaps(a)]
-
-    def pre(a):  # download all needed sheets in parallel before drawing (no-op when already cached)
-        try:
-            local_file(a)
-        except Exception:
-            pass
-
-    progress(0.02, "Checking toposheet files...")
-    with ThreadPoolExecutor(max_workers=4) as exr:
-        list(exr.map(pre, sheets_pm))
     items = [(os.path.basename(a), lambda a=a: pm_src(a)) for a in sheets_pm] + \
             ([("basemap", lambda: xyz_src(ex["base"]))] if ex.get("base") else [])
     n = max(len(items), 1)
@@ -1101,7 +1005,9 @@ def worker_main(job_dir):
                 return f.read()
 
     cfg = json.loads(read("input.json", "r"))
-    _S.sig.update(cfg.get("sig") or {})  # so the worker re-downloads files replaced on Hugging Face
+    _S.sig.update(cfg.get("sig") or {})
+    for a, v, b in cfg.get("bounds") or []:  # sheet bounds already known to the app
+        _S.bounds[(a, v)] = tuple(b)
     ex = {"base": cfg.get("base"), "logo": read("logo.bin")}
     if os.path.exists(os.path.join(job_dir, "dem.npz")):
         with np.load(os.path.join(job_dir, "dem.npz")) as nz:
@@ -1182,83 +1088,13 @@ terrain = st.cache_resource(show_spinner="Loading elevation tiles...", max_entri
 road_data = st.cache_resource(show_spinner="Loading roads...", max_entries=4)(build_roads)
 water_data = st.cache_resource(show_spinner="Loading surface water features...", max_entries=8)(build_water)
 
-# ---------------- one-time setup screen (server cache: exports + processing) ----------------
-if not st.session_state.get("ready"):
-    st.markdown("""<style>
-header[data-testid="stHeader"],[data-testid="stSidebar"],[data-testid="stSidebarCollapsedControl"]{display:none!important}
-.stApp{background:radial-gradient(circle at 18% 12%,rgba(0,170,255,.30),transparent 45%),
-  radial-gradient(circle at 85% 88%,rgba(0,230,170,.20),transparent 42%),
-  linear-gradient(rgba(255,255,255,.05) 1px,transparent 1px) 0 0/46px 46px,
-  linear-gradient(90deg,rgba(255,255,255,.05) 1px,transparent 1px) 0 0/46px 46px,#07162b!important}
-.block-container{max-width:560px!important;margin:0 auto!important;padding-top:24vh!important}
-.su-card{background:rgba(255,255,255,.09);backdrop-filter:blur(16px);-webkit-backdrop-filter:blur(16px);
-  border:1px solid rgba(255,255,255,.28);border-radius:22px;padding:30px 32px 26px;box-shadow:0 24px 70px rgba(0,0,0,.5);text-align:center}
-.su-t{color:#fff;font-size:26px;font-weight:800;letter-spacing:.3px}
-.su-s{color:#b9cde8;font-size:13px!important;margin:6px 0 20px;line-height:1.5}
-.su-spin{width:34px;height:34px;margin:0 auto 14px;border:3px solid rgba(255,255,255,.25);border-top-color:#00c2a8;
-  border-radius:50%;animation:su 1s linear infinite}
-@keyframes su{to{transform:rotate(360deg)}}
-.su-track{position:relative;height:14px;border-radius:99px;background:rgba(255,255,255,.14);
-  border:1px solid rgba(255,255,255,.25);overflow:hidden;box-shadow:inset 0 2px 6px rgba(0,0,0,.35)}
-.su-bar{position:absolute;left:0;top:0;bottom:0;width:var(--to);border-radius:99px;
-  background:linear-gradient(90deg,#0a84ff,#00c2a8);box-shadow:0 0 14px rgba(0,194,168,.7);animation:su-grow 1s ease-out}
-@keyframes su-grow{from{width:var(--from)}to{width:var(--to)}}
-.su-bar::after{content:"";position:absolute;inset:0;
-  background:linear-gradient(110deg,transparent 30%,rgba(255,255,255,.55) 50%,transparent 70%);
-  background-size:200% 100%;animation:su-shine 1.6s linear infinite}
-@keyframes su-shine{from{background-position:200% 0}to{background-position:-200% 0}}
-.su-pct{color:#dbe8fb;font-size:15px!important;font-weight:700;margin-top:12px;letter-spacing:.5px}
-</style>""", unsafe_allow_html=True)
-    _ph, _prev = st.empty(), [0]
-
-    def _setup_ui(pct):
-        pct = max(0, min(100, int(pct)))
-        _ph.markdown(
-            '<div class="su-card"><div class="su-spin"></div><div class="su-t">🛰️ Setting up your workspace</div>'
-            '<div class="su-s">Getting everything ready. This only happens once and can take a few minutes.</div>'
-            f'<div class="su-track"><div class="su-bar" style="--from:{_prev[0]}%;--to:{pct}%"></div></div>'
-            f'<div class="su-pct">{pct}%</div></div>',
-            unsafe_allow_html=True)
-        _prev[0] = pct
-
-    _setup_ui(0)
-    failed = True
-    try:
-        _a = release_assets()
-        _paths = list(dict.fromkeys(
-            p for k, p in _a.items()
-            if (k.lower().endswith(".pmtiles") and (PRELOAD_TOPO or is_vec(k))) or "legend" in k.lower()
-            or k.lower().endswith(("logo.jpg", "logo.jpeg")) or k.startswith("OSM_SHEET_INDEX.")))
-        _missing = lambda: [p for p in _paths if not cached_path(p)]
-        for _pass in range(2):  # a second pass retries whatever failed in the first
-            _todo = _missing()
-            if not _todo:
-                break
-            with ThreadPoolExecutor(max_workers=4) as _ex:
-                for _f in as_completed([_ex.submit(local_file, p) for p in _todo]):
-                    try:
-                        _f.result()
-                    except Exception:
-                        pass
-                    _setup_ui((1 - len(_missing()) / max(len(_paths), 1)) * 100)
-        failed = bool(_missing())
-    except Exception:
-        failed = True
-    if failed:
-        st.error("Couldn't finish preparing your workspace. Please check your internet connection and try again.")
-        if st.button("🔄 Try again", width="stretch"):
-            st.rerun()
-        st.stop()
-    _setup_ui(100)
-    time.sleep(1.0)
-    st.session_state["ready"] = True
-    st.rerun()
-
 st.markdown(f"""
 <style>
 header[data-testid="stHeader"]{{display:none!important}}
+@media (min-width:769px){{
 [data-testid="stSidebarCollapseButton"],[data-testid="stSidebarCollapsedControl"],[data-testid="stExpandSidebarButton"]{{display:none!important}}
 section[data-testid="stSidebar"]{{transform:none!important;margin-left:0!important;visibility:visible!important;min-width:21rem!important;width:21rem!important}}
+}}
 .block-container{{padding:2.5rem 1.5rem .5rem!important}}
 .big-main-title{{font-size:34px;font-weight:800;line-height:1.25;margin-bottom:.1rem}}
 .sub-title{{color:#666;font-size:13px!important;margin-bottom:.6rem}}
@@ -1364,52 +1200,6 @@ def find_asset(assets, stem, ext):
     return next((v for k, v in assets.items() if k.lower().endswith(ext) and stem_of(k) == norm(stem)), None)
 
 
-class Proxy(BaseHTTPRequestHandler):
-    """Local range proxy for the live map (localhost use): disk cache when present, otherwise forwarded to HF."""
-
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Range")
-        self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges")
-
-    def do_OPTIONS(self):
-        self.send_response(204); self._cors(); self.end_headers()
-
-    def do_GET(self):
-        try:
-            code, cr, body = fetch_range(unquote(self.path.split("?")[0].lstrip("/")), self.headers.get("Range"))
-            self.send_response(code)
-            self.send_header("Content-Type", "application/octet-stream")
-            self.send_header("Accept-Ranges", "bytes")
-            self.send_header("Content-Length", str(len(body)))
-            if cr:
-                self.send_header("Content-Range", cr)
-            self._cors(); self.end_headers(); self.wfile.write(body)
-        except (ConnectionError, TimeoutError):
-            pass
-        except Exception:
-            try:
-                self.send_response(500); self._cors(); self.end_headers()
-            except Exception:
-                pass
-
-    def log_message(self, *a):
-        pass
-
-
-@st.cache_resource
-def start_proxy():
-    try:
-        srv = ThreadingHTTPServer(("127.0.0.1", PROXY_PORT), Proxy)
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
-        return srv
-    except OSError:
-        return None
-
-
-start_proxy()
-
-
 @st.cache_resource
 def job_store():
     return {}
@@ -1422,7 +1212,7 @@ def first_bytes(assets, keys, local):
     """Bytes of the first readable HF asset in `keys` (repo root before contributions/), else a local file."""
     for k in keys:
         try:
-            code, _, body = fetch_range(assets[k], None)
+            code, _, body = fetch_range(assets[k])
             if code == 200 and body:
                 return body
         except Exception:
@@ -1451,11 +1241,13 @@ def osm_geojson(v):  # v = file version (cache key only)
     a = release_assets()
     if "OSM_SHEET_INDEX.shp" not in a:
         raise FileNotFoundError("OSM_SHEET_INDEX.shp not found in the HF repo listing")
-    for ext in ("shx", "dbf", "prj", "cpg"):
-        if f"OSM_SHEET_INDEX.{ext}" in a:
-            local_file(a[f"OSM_SHEET_INDEX.{ext}"])
-    os.environ["SHAPE_RESTORE_SHX"] = "YES"
-    g = gpd.read_file(local_file(a["OSM_SHEET_INDEX.shp"]))
+    with tempfile.TemporaryDirectory() as d:  # shapefile parts are read into a temp folder that is deleted right after
+        for ext in ("shp", "shx", "dbf", "prj", "cpg"):
+            if f"OSM_SHEET_INDEX.{ext}" in a:
+                with open(os.path.join(d, f"OSM_SHEET_INDEX.{ext}"), "wb") as f:
+                    f.write(fetch_range(a[f"OSM_SHEET_INDEX.{ext}"])[2])
+        os.environ["SHAPE_RESTORE_SHX"] = "YES"
+        g = gpd.read_file(os.path.join(d, "OSM_SHEET_INDEX.shp"))
     g = g.set_crs(4326) if g.crs is None else g.to_crs(4326)
     g["geometry"] = g.geometry.simplify(0.0005)
     return json.loads(g.to_json(default=str))
@@ -1483,7 +1275,8 @@ def start_export(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, kind, 
     d = tempfile.mkdtemp(prefix="topo_export_")
     with open(os.path.join(d, "input.json"), "w", encoding="utf-8") as f:
         json.dump({"sheets_pm": sheets_pm, "layers": [light(l) for l in layers], "title": title, "sheets_str": sheets_str,
-                   "dpi": dpi, "kind": kind, "base": extra.get("base"), "sig": dict(_S.sig)}, f)
+                   "dpi": dpi, "kind": kind, "base": extra.get("base"), "sig": dict(_S.sig),
+                   "bounds": [[k[0], k[1], list(v)] for k, v in _S.bounds.items()]}, f)
     for name, data in (("legend.png", legend_bytes), ("logo.bin", extra.get("logo"))):
         if data:
             with open(os.path.join(d, name), "wb") as f:
@@ -1495,7 +1288,7 @@ def start_export(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, kind, 
         if extra.get(k):
             with open(os.path.join(d, k + ".json"), "w", encoding="utf-8") as f:
                 json.dump(extra[k], f)
-    env = dict(os.environ, **({"HF_TOKEN": TOKEN} if TOKEN else {}))
+    env = dict(os.environ, **({"HF_TOKEN": TOKEN} if TOKEN else {}), **({"R2_BASE": R2_BASE} if R2_BASE else {}))
     with open(os.path.join(d, "log.txt"), "wb") as lg:
         proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--export", d],
                                 env=env, stdout=lg, stderr=subprocess.STDOUT,
@@ -1576,6 +1369,31 @@ def hf_upload(files, wt):
     return done
 
 
+# mobile only: swipe right from the left edge (or tap the handle) opens the sidebar, swipe left closes it
+SWIPE_JS = """<script>(() => {
+  let P; try { P = window.parent; P.document.body; } catch (e) { return; }
+  if (P.__swipeNav) return; P.__swipeNav = 1;
+  const D = P.document, mobile = () => P.innerWidth <= 768, sb = () => D.querySelector('section[data-testid="stSidebar"]');
+  const isOpen = () => { const s = sb(); return !!s && s.getAttribute('aria-expanded') === 'true'; };
+  const click = q => { const b = D.querySelector(q); if (b) (b.querySelector('button') || b).click(); };
+  const open = () => isOpen() || click('[data-testid="stExpandSidebarButton"],[data-testid="stSidebarCollapsedControl"]');
+  const close = () => isOpen() && click('[data-testid="stSidebarCollapseButton"]');
+  const e = D.createElement('div');
+  e.style.cssText = 'position:fixed;left:0;top:0;bottom:0;width:22px;z-index:999990;touch-action:none;display:none';
+  e.innerHTML = '<div style="position:absolute;left:3px;top:50%;width:5px;height:56px;margin-top:-28px;border-radius:3px;background:rgba(0,0,0,.35)"></div>';
+  D.body.appendChild(e);
+  setInterval(() => { e.style.display = mobile() && !isOpen() ? 'block' : 'none'; }, 300);
+  let x0 = 0, y0 = 0;
+  const start = ev => { x0 = ev.touches[0].clientX; y0 = ev.touches[0].clientY; };
+  const swipe = ev => { const t = ev.changedTouches[0], dx = t.clientX - x0, dy = t.clientY - y0;
+    return Math.abs(dx) > 50 && Math.abs(dx) > 1.5 * Math.abs(dy) ? dx : 0; };
+  e.addEventListener('touchstart', start, {passive: true});
+  e.addEventListener('touchend', ev => { if (swipe(ev) > 0 || Math.abs(ev.changedTouches[0].clientX - x0) < 8) open(); }, {passive: true});
+  D.addEventListener('touchstart', start, {passive: true});
+  D.addEventListener('touchend', ev => { if (mobile() && isOpen() && swipe(ev) < 0) close(); }, {passive: true});
+})();</script>"""
+show_html(SWIPE_JS, 1)
+
 # ---------------- Sidebar ----------------
 st.sidebar.header("⚙️ Data Inputs")
 if st.sidebar.button("🚪 Log out", width="stretch"):
@@ -1614,7 +1432,6 @@ show_con = st.sidebar.toggle(f"〰️ Show Contours ({CONTOUR_STEP} m, lines ≥
 st.sidebar.caption("Roads, water, DEM and contours appear only after a vector + buffer is added, and only inside the outermost buffer.")
 show_osm_index = st.sidebar.toggle("📐 Show OSM Sheet Index", value=False)
 chosen = st.sidebar.multiselect("Toposheets (PMTiles)", list(pm_assets))
-prefetch([pm_assets[n] for n in chosen])  # background download -> export starts instantly
 
 layers, sig = [], []
 for i in (1, 2):
@@ -1718,10 +1535,9 @@ if ou_wkb:
             st.sidebar.error(f"{lab} error: {e}")
 on_dem, on_con, on_rd, on_wt = bool(dem_ov), bool(show_con and terr and terr[3]["features"]), bool(road_fc), bool(water)
 
-# live-map sources per sheet: R2 (if configured) -> local proxy -> HF direct; v = file version (browser cache key)
+# live-map sources per sheet: R2 (if configured) -> HF direct; v = file version (browser cache key)
 pmc = lambda n: {"name": n, "v": zlib.crc32(str(_S.sig.get(pm_assets[n])).encode()),
                  "r2": f"{R2_BASE}/{quote(n)}" if R2_BASE else None,
-                 "url": f"http://127.0.0.1:{PROXY_PORT}/{quote(pm_assets[n])}",
                  "alt": f"{HF_BASE}/resolve/main/{quote(pm_assets[n])}"}
 warm = [{"r2": p["r2"], "v": p["v"]} for p in map(pmc, pm_assets)] if R2_BASE else []
 
@@ -1824,9 +1640,9 @@ class CSrc {
 }
 
 (async () => {
-  for (const p of C.pm) {  // each sheet is independent: R2, then local proxy, then direct HF
+  for (const p of C.pm) {  // each sheet is independent: R2 first, then direct HF
     let ok = false;
-    for (const [label, url] of [['R2', p.r2], ['local proxy', p.url], ['Hugging Face direct', p.alt]]) {
+    for (const [label, url] of [['R2', p.r2], ['Hugging Face direct', p.alt]]) {
       if (!url) continue;
       try {
         const src = new pmtiles.PMTiles(new CSrc(url, p.v));

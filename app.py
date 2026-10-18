@@ -2,16 +2,17 @@
 Geospatial Site Analysis & Mapping Dashboard - single file, Pillow-only export, no disk cache.
 Run:  streamlit run app.py      (login: APP_USER / APP_PASS env or secrets)
 Needs: streamlit, requests, geopandas, shapely>=2, pyproj, pillow>=10.1, pmtiles, numpy, contourpy,
-       mapbox-vector-tile, huggingface_hub + hf_xet (auto-install when needed).
+       mapbox-vector-tile, huggingface_hub + hf_xet, opencv-python-headless, pymupdf (auto-install when needed).
 Data: Hugging Face dataset himanshuguptta/geotiff-hub (HF_TOKEN). Every file is read remotely by byte range.
 R2_BASE (env or secret): toposheet .pmtiles are read from Cloudflare R2 first (same file names), then from HF.
-The browser keeps live-map ranges in its Cache API. PNG export runs in a separate worker process ("--export <dir>").
+Background workers (separate processes): PNG export ("--export <dir>") and PDF georeferencing ("--georef <dir>").
 """
 import os as _os
 LOGIN_USER, LOGIN_PASS = _os.getenv("APP_USER", "Kosher"), _os.getenv("APP_PASS", "Himanshugis")
 
 import os, re, io, sys, gc, json, math, time, uuid, zlib, base64, shutil, zipfile, tempfile, textwrap, \
     subprocess, types, hmac, importlib, faulthandler, threading
+from collections import defaultdict
 from functools import lru_cache
 from urllib.parse import quote
 from xml.sax.saxutils import escape
@@ -31,7 +32,7 @@ import shapely
 from shapely import wkb as swkb, make_valid
 from shapely.geometry import box, shape, mapping, LineString, GeometryCollection
 from shapely.ops import unary_union
-from PIL import Image, ImageDraw, ImageFont, TiffImagePlugin
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, TiffImagePlugin
 from pmtiles.reader import Reader
 
 Image.MAX_IMAGE_PIXELS = None
@@ -43,6 +44,7 @@ HF_TREE = f"https://huggingface.co/api/datasets/{HF_REPO}/tree/main?recursive=tr
 R2_BASE = (os.getenv("R2_BASE") or "").rstrip("/")
 TILE_WORKERS, JOB_TTL = 32, 1800
 LIST_TTL, WATCH_EVERY = 20, 30
+GEO_MIN_ZOOM, GEO_QUALITY, GEO_TTL, GEO_DPI = 6, 90, 3 * 3600, 200
 R = 6378137.0
 COLORS = ["#000000", "#d00000", "#0057ff"]
 DPI_OPTIONS = [300, 500, 800]
@@ -991,12 +993,25 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     return skipped
 
 
-def worker_main(job_dir):
+def make_progress(job_dir):
     def progress(frac, msg):
         p = os.path.join(job_dir, "progress.json")
-        with open(p + ".tmp", "w", encoding="utf-8") as f:
-            json.dump({"progress": frac, "msg": msg}, f)
-        os.replace(p + ".tmp", p)
+        try:
+            with open(p + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"progress": frac, "msg": msg}, f)
+            for a in range(8):  # Windows: the reader may hold the file for a moment
+                try:
+                    os.replace(p + ".tmp", p)
+                    return
+                except PermissionError:
+                    time.sleep(.05 * (a + 1))
+        except OSError:
+            pass  # progress is cosmetic - never fail the job because of it
+    return progress
+
+
+def worker_main(job_dir):
+    progress = make_progress(job_dir)
 
     def read(name, mode="rb"):
         p = os.path.join(job_dir, name)
@@ -1024,9 +1039,181 @@ def worker_main(job_dir):
             f.write(", ".join(skipped))
 
 
-if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] == "--export":
+# =====================================================================================
+# GEOREFERENCING WORKER (PDF -> GeoTIFF + PMTiles; pure Python, runs as a background process)
+# =====================================================================================
+def geo_corners(cv2, rgb, dpi):
+    """Neatline corners (TL, TR, BR, BL) in pixels, found from the magenta grid frame."""
+    mask = cv2.inRange(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV), (120, 50, 50), (170, 255, 255))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    best, amax = None, 10000
+    for c in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        a = cv2.contourArea(c)
+        ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True) if a > amax else ()
+        if len(ap) == 4:
+            best, amax = ap, a
+    if best is None:
+        raise RuntimeError("grid not detected (magenta neatline frame not found in the PDF)")
+    s = best.reshape(-1, 2).astype(np.float32)
+    s = s[s[:, 1].argsort()]
+    tl, tr = s[:2][s[:2][:, 0].argsort()]
+    bl, br = s[2:][s[2:][:, 0].argsort()]
+    base = np.array([tl, tr, br, bl])
+    inset = (np.array([2100, 1102]) - np.array([1922, 924])) * (dpi / 300.0)
+    v1, v2 = base[1] - base[0], base[3] - base[0]
+    n1, n2 = v1 / np.linalg.norm(v1), v2 / np.linalg.norm(v2)
+    return [base[0] + inset[0] * n1 + inset[1] * n2, base[1] - inset[0] * n1 + inset[1] * n2,
+            base[2] - inset[0] * n1 - inset[1] * n2, base[3] + inset[0] * n1 - inset[1] * n2]
+
+
+def geo_tif(cv2, img, M, b, path):
+    """EPSG:4326 GeoTIFF of the sheet rectangle (3 bands, nodata 0, deflate) -> (rgb, mask) for the preview."""
+    minx, miny, maxx, maxy = [float(v) for v in b]
+    w = int(max(1, round(float((maxx - minx) * math.hypot(M[0, 0], M[0, 1])))))
+    h = int(max(1, round(float((maxy - miny) * math.hypot(M[1, 0], M[1, 1])))))
+    dx, dy = (maxx - minx) / w, (maxy - miny) / h
+    lon0, lat0 = minx + dx / 2, maxy - dy / 2
+    A = np.ascontiguousarray([[M[0, 0] * dx, -M[1, 0] * dy, M[0, 0] * lon0 + M[1, 0] * lat0 + M[2, 0]],
+                              [M[0, 1] * dx, -M[1, 1] * dy, M[0, 1] * lon0 + M[1, 1] * lat0 + M[2, 1]]], np.float64)
+    fl = cv2.WARP_INVERSE_MAP
+    img = np.ascontiguousarray(img)
+    out = cv2.warpAffine(img, A, (w, h), flags=cv2.INTER_CUBIC | fl, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    msk = cv2.warpAffine(np.full(img.shape[:2], 255, np.uint8), A, (w, h), flags=cv2.INTER_NEAREST | fl,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    keys = (1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326)  # geographic, PixelIsArea, EPSG:4326
+    ensure("tifffile", "tifffile").imwrite(  # pure-Python writer (no libtiff DLL)
+        path, np.ascontiguousarray(out), photometric="rgb", compression="deflate",
+        extratags=[(33550, "d", 3, (dx, dy, 0.0), True), (33922, "d", 6, (0.0, 0.0, 0.0, minx, maxy, 0.0), True),
+                   (34735, "H", len(keys), keys, True), (42113, "s", 2, "0", True)])
+    return out, msk
+
+
+def geo_tiles(cv2, img, M, b, pm_path, prog):
+    """Web-Mercator WebP tile pyramid straight from the source pixels (one resample), written as PMTiles."""
+    from pmtiles.writer import write
+    from pmtiles.tile import zxy_to_tileid, TileType, Compression
+    minx, miny, maxx, maxy = b
+    lat_c = math.radians((miny + maxy) / 2)
+    res_src = (111320 * math.cos(lat_c) / math.hypot(M[0, 0], M[0, 1]) + 110574 / math.hypot(M[1, 0], M[1, 1])) / 2
+    zlo = GEO_MIN_ZOOM
+    zmax = int(min(20, max(zlo, round(math.log2(156543.03392 * math.cos(lat_c) / res_src)))))
+    f = 156543.03392 * math.cos(lat_c) / 2 ** zmax / res_src
+    src, sx, sy = img, 1.0, 1.0
+    if f > 1.05:  # tiles are coarser than the scan: pre-shrink with INTER_AREA (no aliasing)
+        src = cv2.resize(img, (max(1, round(img.shape[1] / f)), max(1, round(img.shape[0] / f))), interpolation=cv2.INTER_AREA)
+        sx, sy = src.shape[1] / img.shape[1], src.shape[0] / img.shape[0]
+    n, x0, x1, y0, y1 = tile_range(b, zmax)
+    u = (np.arange(256) + .5) / 256
+    sharp = ImageFilter.UnsharpMask(radius=.8, percent=70, threshold=3)
+
+    def make_tile(x, y):
+        if not (x0 <= x <= x1 and y0 <= y <= y1):
+            return None
+        LON, LAT = np.meshgrid((x + u) / n * 360 - 180, np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * (y + u) / n)))))
+        inside = (LON >= minx) & (LON <= maxx) & (LAT >= miny) & (LAT <= maxy)
+        if not inside.any():
+            return None
+        px = ((LON * M[0, 0] + LAT * M[1, 0] + M[2, 0] + .5) * sx - .5).astype(np.float32)
+        py = ((LON * M[0, 1] + LAT * M[1, 1] + M[2, 1] + .5) * sy - .5).astype(np.float32)
+        rgb = cv2.remap(src, px, py, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return Image.fromarray(np.dstack([rgb, (inside * 255).astype(np.uint8)]), "RGBA")
+
+    def enc(im):
+        if im.getchannel("A").getextrema()[0] == 255:
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, "WEBP", quality=GEO_QUALITY, method=2, **({"alpha_quality": 100} if im.mode == "RGBA" else {}))
+        return buf.getvalue()
+
+    def shrink(kids):
+        cv = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+        for (dx, dy), im in kids.items():
+            cv.paste(im, (dx * 256, dy * 256))
+        r, g, bl, a = cv.resize((256, 256), Image.Resampling.LANCZOS).split()
+        r, g, bl = Image.merge("RGB", (r, g, bl)).filter(sharp).split()
+        return Image.merge("RGBA", (r, g, bl, a))
+
+    def group(pxy):  # 4 child tiles at max zoom -> encoded bytes + the raw parent tile
+        kids = {(dx, dy): t for dy in (0, 1) for dx in (0, 1)
+                if (t := make_tile(2 * pxy[0] + dx, 2 * pxy[1] + dy)) is not None}
+        return [(2 * pxy[0] + dx, 2 * pxy[1] + dy, enc(t)) for (dx, dy), t in kids.items()], (shrink(kids) if kids else None)
+
+    tiles, level = {}, {}
+    with ThreadPoolExecutor(max_workers=max(1, min(os.cpu_count() or 4, 8))) as ex:
+        pxs = sorted({(x >> 1, y >> 1) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)})
+        for i, (pxy, (encd, parent)) in enumerate(zip(pxs, ex.map(group, pxs)), 1):
+            tiles.update({zxy_to_tileid(zmax, x, y): data for x, y, data in encd})
+            if parent is not None:
+                level[pxy] = parent
+            prog(.8 * i / len(pxs), f"cutting tiles z{zmax}")
+        for z in range(zmax - 1, zlo - 1, -1):
+            items = list(level.items())
+            for (x, y), data in zip((k for k, _ in items), ex.map(enc, (v for _, v in items))):
+                tiles[zxy_to_tileid(z, x, y)] = data
+            if z > zlo:
+                grp = defaultdict(dict)
+                for (x, y), im in items:
+                    grp[(x >> 1, y >> 1)][(x & 1, y & 1)] = im
+                level = dict(zip(grp, ex.map(shrink, grp.values())))
+            prog(.8 + .15 * (zmax - z) / max(1, zmax - zlo), f"building overview z{z}")
+
+    prog(.96, "writing PMTiles")
+    e7 = lambda v: int(round(v * 1e7))
+    with write(pm_path) as w:
+        for tid in sorted(tiles):
+            w.write_tile(tid, tiles[tid])
+        w.finalize({"tile_type": TileType.WEBP, "tile_compression": Compression.NONE, "min_zoom": zlo, "max_zoom": zmax,
+                    "min_lon_e7": e7(minx), "min_lat_e7": e7(miny), "max_lon_e7": e7(maxx), "max_lat_e7": e7(maxy),
+                    "center_zoom": zmax, "center_lon_e7": e7((minx + maxx) / 2), "center_lat_e7": e7((miny + maxy) / 2)},
+                   {"name": os.path.basename(pm_path), "format": "webp", "type": "overlay",
+                    "minzoom": str(zlo), "maxzoom": str(zmax), "bounds": f"{minx},{miny},{maxx},{maxy}"})
+    return zlo, zmax, len(tiles)
+
+
+def georef_one(cv2, pdf_path, name, b, out_dir, dpi, prog):
+    fz = ensure("pymupdf", "pymupdf")
+    prog(.02, "rendering PDF")
+    with fz.open(pdf_path) as doc:
+        pix = doc.load_page(0).get_pixmap(matrix=fz.Matrix(dpi / 72, dpi / 72), alpha=False)
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3).copy()
+    prog(.1, "detecting grid")
+    pts = geo_corners(cv2, img, dpi)
+    minx, miny, maxx, maxy = b
+    ll = np.array([(minx, maxy), (maxx, maxy), (maxx, miny), (minx, miny)], float)  # TL, TR, BR, BL
+    # affine least-squares fit: src_px = [lon, lat, 1] @ M  (cv2.solve, not numpy LAPACK - avoids DLL conflicts on Windows/conda)
+    M = cv2.solve(np.column_stack([ll, np.ones(4)]), np.array(pts, np.float64), flags=cv2.DECOMP_SVD)[1]
+    prog(.15, "writing GeoTIFF")
+    tif, pm = os.path.join(out_dir, name + ".tif"), os.path.join(out_dir, name + ".pmtiles")
+    out, msk = geo_tif(cv2, img, M, b, tif)
+    del out, msk
+    prog(.25, "cutting tiles")
+    zlo, zmax, nt = geo_tiles(cv2, img, M, b, pm, lambda fr, m: prog(.25 + .73 * fr, m))
+    return {"name": name, "pb": [[miny, minx], [maxy, maxx]], "zoom": [zlo, zmax], "tiles": nt,
+            "tif_mb": round(os.path.getsize(tif) / 1e6, 1), "pm_mb": round(os.path.getsize(pm) / 1e6, 1)}
+
+
+def georef_main(job_dir):
+    progress = make_progress(job_dir)
+    with open(os.path.join(job_dir, "input.json"), encoding="utf-8") as f:
+        cfg = json.load(f)
+    progress(0.0, "Loading libraries...")
+    cv2, results, items = ensure("cv2", "opencv-python-headless"), [], cfg["items"]
+    for i, it in enumerate(items):
+        lo, span = i / len(items), 1 / len(items)
+        try:
+            results.append(georef_one(cv2, os.path.join(job_dir, it["file"]), it["name"], it["bounds"], job_dir, cfg["dpi"],
+                                      lambda fr, m, lo=lo, span=span, nm=it["name"]: progress(lo + span * fr, f"{nm}: {m}")))
+        except Exception as e:
+            results.append({"name": it["name"], "error": f"{type(e).__name__}: {e}"})
+        gc.collect()
+    with open(os.path.join(job_dir, "results.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f)
+    progress(1.0, "Done")
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] in ("--export", "--georef"):
     faulthandler.enable()
-    worker_main(sys.argv[2])
+    (worker_main if sys.argv[1] == "--export" else georef_main)(sys.argv[2])
     sys.exit(0)
 
 
@@ -1208,6 +1395,14 @@ def job_store():
 JOBS = job_store()
 
 
+@st.cache_resource
+def georef_store():
+    return {}
+
+
+GEO = georef_store()
+
+
 def first_bytes(assets, keys, local):
     """Bytes of the first readable HF asset in `keys` (repo root before contributions/), else a local file."""
     for k in keys:
@@ -1236,8 +1431,7 @@ def logo_image(assets):
     return first_bytes(assets, root + contrib, "logo.jpg")
 
 
-@st.cache_resource(show_spinner="Loading OSM sheet index...", max_entries=1)
-def osm_geojson(v):  # v = file version (cache key only)
+def read_osm_index(v):  # v = file version (cache key only) -> GeoDataFrame (EPSG:4326)
     a = release_assets()
     if "OSM_SHEET_INDEX.shp" not in a:
         raise FileNotFoundError("OSM_SHEET_INDEX.shp not found in the HF repo listing")
@@ -1248,9 +1442,31 @@ def osm_geojson(v):  # v = file version (cache key only)
                     f.write(fetch_range(a[f"OSM_SHEET_INDEX.{ext}"])[2])
         os.environ["SHAPE_RESTORE_SHX"] = "YES"
         g = gpd.read_file(os.path.join(d, "OSM_SHEET_INDEX.shp"))
-    g = g.set_crs(4326) if g.crs is None else g.to_crs(4326)
+    return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
+
+
+@st.cache_resource(show_spinner="Loading OSM sheet index...", max_entries=1)
+def osm_geojson(v):
+    g = read_osm_index(v)
     g["geometry"] = g.geometry.simplify(0.0005)
     return json.loads(g.to_json(default=str))
+
+
+@st.cache_resource(show_spinner="Reading OSM sheet index...", max_entries=1)
+def osm_sheet_table(v):
+    """{CLEAN SHEET NAME: (min_lon, min_lat, max_lon, max_lat)} from the OSM sheet index."""
+    g = read_osm_index(v)
+    col = "OSM_SHEET_" if "OSM_SHEET_" in g.columns else next(c for c in g.columns if c != "geometry" and g[c].dtype == object)
+    out = {}
+    for nm, r in zip(g[col].astype(str), g.geometry.bounds.itertuples(index=False)):
+        out.setdefault(re.sub(r"\s+", "", nm).upper(), (float(r.minx), float(r.miny), float(r.maxx), float(r.maxy)))
+    return out
+
+
+def match_sheet(filename, table):
+    """(sheet name, bounds) for the first token of the file name that is a sheet in the OSM index, else None."""
+    return next(((c.upper(), table[c.upper()]) for c in re.findall(r"[A-Za-z0-9]+", os.path.splitext(filename)[0])
+                 if c.upper() in table), None)
 
 
 def sheet_no(name):
@@ -1271,6 +1487,62 @@ def describe_exit(rc):
     return f"{known[code]} [0x{code:08X}]" if code in known else f"exit code {rc}"
 
 
+# ---------------- background jobs (separate processes) ----------------
+def spawn(mode, d):
+    """Start `app.py <mode> <dir>` as a background process, output to <dir>/log.txt."""
+    env = dict(os.environ, **({"HF_TOKEN": TOKEN} if TOKEN else {}), **({"R2_BASE": R2_BASE} if R2_BASE else {}))
+    with open(os.path.join(d, "log.txt"), "wb") as lg:
+        return subprocess.Popen([sys.executable, os.path.abspath(__file__), mode, d], env=env, stdout=lg,
+                                stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def new_job(mode, d, msg, **extra):
+    return {"status": "running", "progress": 0.0, "msg": msg, "start": time.time(), "end": None, "error": None,
+            "dir": d, "proc": spawn(mode, d), **extra}
+
+
+def poll(job, ok_file, on_ok):
+    """Update progress; when the process has ended call on_ok(job) (success) or record the error."""
+    if not job or job["status"] != "running":
+        return
+    d = job["dir"]
+    try:
+        with open(os.path.join(d, "progress.json"), encoding="utf-8") as f:
+            p = json.load(f)
+        job["progress"], job["msg"] = p["progress"], p["msg"]
+    except Exception:
+        pass
+    rc = job["proc"].poll()
+    if rc is None:
+        return
+    job["end"] = time.time()
+    if rc == 0 and os.path.exists(os.path.join(d, ok_file)):
+        on_ok(job)
+        job.update(status="done", progress=1.0, msg="Done")
+    else:
+        try:
+            with open(os.path.join(d, "log.txt"), encoding="utf-8", errors="replace") as f:
+                tail = "".join(f.readlines()[-12:]).strip()
+        except Exception:
+            tail = ""
+        job.update(status="error", error=f"{describe_exit(rc)} | last step: {job.get('msg')}" + (f"\n{tail}" if tail else ""))
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def kill_job(job, status=None):
+    if not job:
+        return
+    try:
+        if job["status"] == "running":
+            job["proc"].terminate()
+            job["proc"].wait(timeout=5)
+    except Exception:
+        pass
+    if status:
+        job.update(status=status, end=time.time())
+    shutil.rmtree(job["dir"], ignore_errors=True)
+
+
 def start_export(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, kind, extra):
     d = tempfile.mkdtemp(prefix="topo_export_")
     with open(os.path.join(d, "input.json"), "w", encoding="utf-8") as f:
@@ -1288,85 +1560,153 @@ def start_export(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, kind, 
         if extra.get(k):
             with open(os.path.join(d, k + ".json"), "w", encoding="utf-8") as f:
                 json.dump(extra[k], f)
-    env = dict(os.environ, **({"HF_TOKEN": TOKEN} if TOKEN else {}), **({"R2_BASE": R2_BASE} if R2_BASE else {}))
-    with open(os.path.join(d, "log.txt"), "wb") as lg:
-        proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "--export", d],
-                                env=env, stdout=lg, stderr=subprocess.STDOUT,
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    return {"status": "running", "progress": 0.0, "msg": "Starting export process...", "start": time.time(),
-            "end": None, "result": None, "error": None, "dpi": dpi, "kind": kind, "dir": d, "proc": proc}
+    return new_job("--export", d, "Starting export process...", result=None, dpi=dpi, kind=kind)
+
+
+def _export_done(job):
+    with open(os.path.join(job["dir"], "result.png"), "rb") as f:
+        job["result"] = f.read()
+    try:
+        with open(os.path.join(job["dir"], "warn.txt")) as f:
+            job["warn"] = f.read()
+    except Exception:
+        pass
+    shutil.rmtree(job["dir"], ignore_errors=True)
 
 
 def refresh_job(job):
-    if not job or job["status"] != "running":
-        return
+    poll(job, "result.png", _export_done)
+
+
+def start_georef(items, dpi):
+    d = tempfile.mkdtemp(prefix="topo_georef_")
+    for i, it in enumerate(items):
+        with open(os.path.join(d, f"in_{i}.pdf"), "wb") as f:
+            f.write(it.pop("data"))
+        it["file"] = f"in_{i}.pdf"
+    with open(os.path.join(d, "input.json"), "w", encoding="utf-8") as f:
+        json.dump({"dpi": dpi, "items": items}, f)
+    return new_job("--georef", d, "Starting...", results=[], push=None, skipped=[])
+
+
+def _geo_done(job):
     d = job["dir"]
+    with open(os.path.join(d, "results.json"), encoding="utf-8") as f:
+        job["results"] = json.load(f)
+    for x in os.listdir(d):  # source PDFs are no longer needed
+        if x.startswith("in_") and x.endswith(".pdf"):
+            os.remove(os.path.join(d, x))
+
+
+def refresh_geo(job):
+    poll(job, "results.json", _geo_done)
+
+
+def write_token():
     try:
-        with open(os.path.join(d, "progress.json"), encoding="utf-8") as f:
-            p = json.load(f)
-        job["progress"], job["msg"] = p["progress"], p["msg"]
+        return os.getenv("HF_WRITE_TOKEN") or st.secrets.get("HF_WRITE_TOKEN") or TOKEN
     except Exception:
-        pass
-    rc = job["proc"].poll()
-    if rc is None:
-        return
-    job["end"] = time.time()
-    res = os.path.join(d, "result.png")
-    if rc == 0 and os.path.exists(res):
-        with open(res, "rb") as f:
-            job["result"] = f.read()
-        try:
-            with open(os.path.join(d, "warn.txt")) as f:
-                job["warn"] = f.read()
-        except Exception:
+        return TOKEN
+
+
+def hf_commit(pairs, wt, msg):
+    """[(local file, path in repo)] -> uploaded to the HF dataset, one commit per file (3 tries each)."""
+    api = ensure("huggingface_hub", "huggingface_hub hf_xet").HfApi(token=wt)
+    for local, dest in pairs:
+        for attempt in range(3):
+            try:
+                api.upload_file(path_or_fileobj=local, path_in_repo=dest, repo_id=HF_REPO, repo_type="dataset",
+                                commit_message=f"{msg}: {os.path.basename(dest)}")
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(3 * (attempt + 1))
+
+
+@st.cache_resource
+def tile_server():
+    """127.0.0.1 HTTP server (Range + CORS) that serves finished georeferenced tile files to the live map; returns its port."""
+    from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
             pass
-        job.update(status="done", progress=1.0, msg="Done")
-    else:
+
+        def _cors(self):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Range")
+            self.send_header("Access-Control-Expose-Headers", "Content-Range, Content-Length")
+
+        def do_OPTIONS(self):
+            self.send_response(204)
+            self._cors()
+            self.end_headers()
+
+        def serve(self, head):
+            parts = self.path.split("?")[0].strip("/").split("/")
+            j = GEO.get(parts[0]) if len(parts) == 2 else None
+            fp = os.path.join(j["dir"], os.path.basename(parts[1])) if j and j["status"] == "done" else ""
+            if not fp.endswith(".pmtiles") or not os.path.isfile(fp):
+                return self.send_error(404)
+            size = os.path.getsize(fp)
+            a, b, code = 0, size - 1, 200
+            m = re.match(r"bytes=(\d*)-(\d*)", self.headers.get("Range", ""))
+            if m and (m[1] or m[2]):
+                a, code = (int(m[1]), 206) if m[1] else (max(0, size - int(m[2])), 206)
+                if m[1] and m[2]:
+                    b = min(int(m[2]), size - 1)
+            self.send_response(code)
+            self._cors()
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(max(0, b - a + 1)))
+            if code == 206:
+                self.send_header("Content-Range", f"bytes {a}-{b}/{size}")
+            self.end_headers()
+            if not head:
+                with open(fp, "rb") as f:
+                    f.seek(a)
+                    self.wfile.write(f.read(b - a + 1))
+
+        do_GET = lambda self: self.serve(False)
+        do_HEAD = lambda self: self.serve(True)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
+
+
+def push_bg(job, pairs, wt):
+    """Background thread: upload georeferenced PMTiles to HF while the app stays usable."""
+    job["push"] = {"status": "running"}
+
+    def run():
         try:
-            with open(os.path.join(d, "log.txt"), encoding="utf-8", errors="replace") as f:
-                tail = "".join(f.readlines()[-12:]).strip()
-        except Exception:
-            tail = ""
-        job.update(status="error", error=f"{describe_exit(rc)} | last step: {job.get('msg')}" + (f"\n{tail}" if tail else ""))
-    shutil.rmtree(d, ignore_errors=True)
-
-
-def cancel_job(job):
-    try:
-        job["proc"].terminate()
-        job["proc"].wait(timeout=5)
-    except Exception:
-        pass
-    job.update(status="cancelled", end=time.time())
-    shutil.rmtree(job["dir"], ignore_errors=True)
+            hf_commit(pairs, wt, "Georeferenced toposheet")
+            job["push"] = {"status": "done", "paths": [d for _, d in pairs]}
+        except Exception as e:
+            job["push"] = {"status": "error", "msg": str(e)}
+    threading.Thread(target=run, daemon=True).start()
 
 
 def hf_upload(files, wt):
     """Upload files to contributions/ in the HF dataset, one commit per file."""
-    HfApi = ensure("huggingface_hub", "huggingface_hub hf_xet").HfApi
-    api, ts, done = HfApi(token=wt), int(time.time()), []
+    ts, pairs, tmps = int(time.time()), [], []
     for f in files:
-        dest = f"contributions/{ts}_{re.sub(r'[^\w.-]', '_', f.name)}"
         with tempfile.NamedTemporaryFile(delete=False, suffix=".upload") as t:
             t.write(f.getbuffer())
-            tmp = t.name
-        try:
-            for attempt in range(3):
-                try:
-                    api.upload_file(path_or_fileobj=tmp, path_in_repo=dest, repo_id=HF_REPO, repo_type="dataset",
-                                    commit_message=f"Contribution {ts}: {f.name}")
-                    break
-                except Exception:
-                    if attempt == 2:
-                        raise
-                    time.sleep(3 * (attempt + 1))
-        finally:
+        tmps.append(t.name)
+        pairs.append((t.name, f"contributions/{ts}_{re.sub(r'[^\w.-]', '_', f.name)}"))
+    try:
+        hf_commit(pairs, wt, "Contribution")
+    finally:
+        for t in tmps:
             try:
-                os.remove(tmp)
+                os.remove(t)
             except OSError:
                 pass
-        done.append(dest)
-    return done
+    return [d for _, d in pairs]
 
 
 # mobile only: swipe right from the left edge (or tap the handle) opens the sidebar, swipe left closes it
@@ -1431,7 +1771,56 @@ show_dem = st.sidebar.toggle("⛰️ Show DEM (Elevation)", value=False)
 show_con = st.sidebar.toggle(f"〰️ Show Contours ({CONTOUR_STEP} m, lines ≥ {CONTOUR_MIN_LEN} m long)", value=False)
 st.sidebar.caption("Roads, water, DEM and contours appear only after a vector + buffer is added, and only inside the outermost buffer.")
 show_osm_index = st.sidebar.toggle("📐 Show OSM Sheet Index", value=False)
-chosen = st.sidebar.multiselect("Toposheets (PMTiles)", list(pm_assets))
+
+# ---- georeferencing job state (background process; finished results are removed after GEO_TTL) ----
+for _gid, _gj in list(GEO.items()):
+    if _gj["status"] != "running" and _gj.get("end") and time.time() - _gj["end"] > GEO_TTL:
+        kill_job(_gj)
+        GEO.pop(_gid, None)
+gjob = GEO.get(st.session_state.get("geo_id"))
+refresh_geo(gjob)
+geo_busy = bool(gjob) and (gjob["status"] == "running" or (gjob.get("push") or {}).get("status") == "running")
+
+if st.sidebar.toggle("🧭 Georeference toposheet PDFs", value=False, key="do_geo"):
+    geo_files = st.sidebar.file_uploader("Toposheet PDF(s)", type=["pdf"], accept_multiple_files=True,
+                                         key="geo_pdfs", disabled=geo_busy)
+    if st.sidebar.button("▶️ Start georeferencing", width="stretch", disabled=geo_busy or not geo_files, key="geo_start"):
+        try:
+            tbl = osm_sheet_table(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
+        except Exception as e:
+            tbl = None
+            st.sidebar.error(f"Sheet index: {e}")
+        if tbl:
+            items, bad, have, seen = [], [], [], set()
+            for f in geo_files:
+                hit = match_sheet(f.name, tbl)
+                stem = re.sub(r"[^\w.-]", "_", os.path.splitext(f.name)[0])
+                if not hit:
+                    bad.append(f.name)
+                elif stem + ".pmtiles" in pm_assets or stem in seen:  # already in the library -> skip, just show it
+                    have.append(stem + ".pmtiles")
+                else:
+                    seen.add(stem)
+                    items.append({"name": stem, "bounds": list(hit[1]), "data": f.getvalue()})
+            if have:
+                st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | set(have))
+            if items:
+                kill_job(GEO.pop(st.session_state.get("geo_id"), None))
+                gid = uuid.uuid4().hex
+                GEO[gid] = start_georef(items, GEO_DPI)
+                GEO[gid]["skipped"] = bad
+                st.session_state["geo_id"], st.session_state["geo_poll"] = gid, True
+                st.rerun()
+            elif bad:
+                st.sidebar.error("No PDF name matches a sheet: " + ", ".join(bad))
+            else:
+                st.rerun()
+
+_pend = st.session_state.get("geo_select", [])  # sheets to switch on once they are in the list
+if any(n in pm_assets for n in _pend):
+    st.session_state["chosen"] = sorted(set(st.session_state.get("chosen", [])) | {n for n in _pend if n in pm_assets})
+    st.session_state["geo_select"] = [n for n in _pend if n not in pm_assets]
+chosen = st.sidebar.multiselect("Toposheets (PMTiles)", list(pm_assets), key="chosen")
 
 layers, sig = [], []
 for i in (1, 2):
@@ -1452,10 +1841,7 @@ for i in (1, 2):
 with st.sidebar.expander("🤝 Contribute files"):
     cfs = st.file_uploader("Any file: PMTiles, GeoTIFF, vector, PNG, PDF, ...", accept_multiple_files=True, key="contrib")
     if cfs and st.button("Submit contribution"):
-        try:
-            wt = os.getenv("HF_WRITE_TOKEN") or st.secrets.get("HF_WRITE_TOKEN") or TOKEN
-        except Exception:
-            wt = TOKEN
+        wt = write_token()
         if not wt:
             st.error("No write token: set HF_WRITE_TOKEN (env or Streamlit secret).")
         else:
@@ -1541,12 +1927,17 @@ pmc = lambda n: {"name": n, "v": zlib.crc32(str(_S.sig.get(pm_assets[n])).encode
                  "alt": f"{HF_BASE}/resolve/main/{quote(pm_assets[n])}"}
 warm = [{"r2": p["r2"], "v": p["v"]} for p in map(pmc, pm_assets)] if R2_BASE else []
 
+geo_ov = [r for r in (gjob["results"] if gjob and gjob["status"] == "done" else [])
+          if "error" not in r and r["name"] + ".pmtiles" not in pm_assets]  # sheets not in the library yet
+geo_pm = [{"name": r["name"] + ".pmtiles", "v": zlib.crc32(st.session_state["geo_id"].encode()), "r2": None,
+           "alt": f"http://127.0.0.1:{tile_server()}/{st.session_state['geo_id']}/{r['name']}.pmtiles"} for r in geo_ov]
+
 cfg = {
     "basemap": basemap, "base": BASEMAPS[basemap], "colors": COLORS, "layers": [dict(light(l), fc=site_fc(l)) for l in layers],
-    "sig": "|".join(sig),
-    "pm": [pmc(n) for n in chosen] if show_topo else [],
+    "sig": "|".join(sig + [g["name"] for g in geo_ov]),  # new sheets -> the map re-fits to them
+    "pm": ([pmc(n) for n in chosen] + geo_pm) if show_topo else [],
     "all": warm, "wv": str(zlib.crc32(json.dumps(warm).encode())),
-    "osm_index": osm_json,
+    "osm_index": osm_json, "georef": [r["pb"] for r in geo_ov],
     "dem": {"url": dem_ov[0], "b": dem_ov[1]} if on_dem else None,
     "contours": terr[3] if on_con else None, "con_labels": terr[5] if on_con else None,
     "roads": road_fc, "water": water or None, "wcol": {k: v[2] for k, v in DRAIN.items()},
@@ -1621,6 +2012,8 @@ C.layers.forEach(lay => {
     }}).addTo(map));
 });
 if (all && !keep) map.fitBounds(all.pad(0.1));
+
+if (C.georef.length && !keep) map.fitBounds(L.latLngBounds(C.georef.flat(1)).pad(0.1));  // new sheets: zoom to them
 
 // PMTiles source that stores every byte range in the browser Cache API (header, directories, tiles) -> repeat views are instant
 class CSrc {
@@ -1722,6 +2115,82 @@ with col_leg:
         if leg_bytes:
             st.image(leg_bytes, caption="CONVENTIONAL SYMBOLS", width="stretch")
 
+
+# ---------------- georeferencing status (background; finished sheets are added to the library and switched on) ----------------
+@st.fragment(run_every=2 if geo_busy else None)
+def geo_ui():
+    j = GEO.get(st.session_state.get("geo_id"))
+    refresh_geo(j)
+    if not j:
+        return
+
+    def end():
+        kill_job(j)
+        GEO.pop(st.session_state.pop("geo_id", None), None)
+        st.session_state.pop("geo_poll", None)
+
+    def clear_btn(label="🗑️ Clear"):
+        if st.button(label, key="geo_x", width="stretch"):
+            end()
+            st.rerun()
+
+    if j["status"] != "running" and (j.get("push") or {}).get("status") != "running" and st.session_state.pop("geo_poll", False):
+        st.rerun()  # full rerun: draws the sheets on the map
+    for nm in j["skipped"]:
+        st.warning(f"{nm}: no matching sheet - skipped.")
+    el = int((j["end"] or time.time()) - j["start"])
+    if j["status"] == "running":
+        st.progress(min(j["progress"], .99), text=f"Georeferencing: {j['msg']}  |  {el}s  (background - keep working)")
+        return clear_btn("⛔ Cancel georeferencing")
+    if j["status"] == "error":
+        st.error(f"Georeferencing failed: {j['error']}")
+        return clear_btn()
+    ok = [r for r in j["results"] if "error" not in r]
+    for r in j["results"]:
+        if "error" in r:
+            st.error(f"{r['name']}: {r['error']}")
+    pu = j.get("push") or {}
+    if pu.get("status") == "done":  # added: switch the sheets on, they now render from the library
+        st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | {r["name"] + ".pmtiles" for r in ok})
+        release_assets.clear()
+        end()
+        st.rerun()
+    if not ok:
+        return clear_btn()
+    st.markdown("### 🧭 Georeferenced sheets")
+    st.caption(f"Done in {el}s. Check that they line up on the map, then download or add them to the library.")
+    st.markdown("| Sheet | Zoom | Tiles | Size | Already in library |\n|---|---|---|---|---|\n" + "\n".join(
+        f"| {r['name']} | {r['zoom'][0]}-{r['zoom'][1]} | {r['tiles']} | {r['pm_mb']} MB | "
+        f"{'yes (skipped)' if r['name'] + '.pmtiles' in pm_assets else 'no'} |" for r in ok))
+    cols = st.columns(4)
+    for i, r in enumerate(ok):
+        with open(os.path.join(j["dir"], r["name"] + ".tif"), "rb") as fh:
+            cols[i % 4].download_button(f"⬇️ {r['name']} (GeoTIFF, {r['tif_mb']} MB)", fh.read(), file_name=r["name"] + ".tif",
+                                        mime="image/tiff", width="stretch", key=f"geo_dl{i}")
+    new = [r for r in ok if r["name"] + ".pmtiles" not in pm_assets]  # never push what is already there (no duplicates)
+    if pu.get("status") == "running":
+        st.info("☁️ Adding to the library in the background...")
+    elif not new:
+        st.info("All sheets are already in the library.")
+    else:
+        if pu.get("status") == "error":
+            st.error(f"Upload failed: {pu['msg']}")
+        sure = st.checkbox("✅ I checked the map - the sheet(s) line up correctly", key="geo_ok")
+        if st.button("☁️ Add to library", disabled=not sure, key="geo_push", width="stretch"):
+            wt = write_token()
+            if not wt:
+                st.error("No write token: set HF_WRITE_TOKEN (env or Streamlit secret).")
+            else:
+                dirs = [os.path.dirname(p) for p in pm_assets.values() if not p.startswith("contributions/")]
+                folder = max(set(dirs), key=dirs.count) if dirs else ""
+                push_bg(j, [(os.path.join(j["dir"], r["name"] + ".pmtiles"), f"{folder}/{r['name']}.pmtiles".lstrip("/"))
+                            for r in new], wt)
+                st.session_state["geo_poll"] = True
+                st.rerun()
+    clear_btn("🗑️ Clear")
+
+
+geo_ui()
 st.markdown("---")
 
 for jid, j in list(JOBS.items()):  # drop finished jobs (and their PNG bytes) after JOB_TTL
@@ -1751,7 +2220,7 @@ def export_ui():
 
     if running:
         if cb.button("⛔ Cancel export", width="stretch"):
-            cancel_job(job)
+            kill_job(job, "cancelled")
             st.session_state.pop("polling", None)
             st.rerun()
     elif cb.button("🚀 Generate High-Res Map", width="stretch"):

@@ -1,7 +1,13 @@
-streamlit
+streamlit>=1.50.0
 requests
-geopandas
-shapely
-pyproj
+numpy
 pillow>=10.1
+shapely>=2.0
+pyproj
+geopandas>=1.0
+pyogrio
+contourpy
 pmtiles
+mapbox-vector-tile
+huggingface_hub
+hf_xet

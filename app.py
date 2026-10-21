@@ -1008,14 +1008,6 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     for y, lab in ylabels:
         put_text(d, (mx0 - pt(4), y), lab, f_tick, "rm")
     put_text(d, ((mx0 + mx1) / 2, H * .03), "Topographic MAP" if topo else kind, get_font(pt(22), True), "mm")
-    if ex.get("logo"):
-        try:
-            lg = Image.open(io.BytesIO(ex["logo"])).convert("RGB")
-            lh = int(.042 * H)
-            img.paste(lg.resize((max(1, int(lg.width * lh / lg.height)), lh), Image.Resampling.LANCZOS), (mx0, int(.006 * H)))
-        except Exception:
-            pass
-
     PX = lambda u: px0 + u * pw
     PY = lambda v: my1 - v * ph
     d.rectangle([px0, my0, px1, my1], outline="black", width=pt(1.5))

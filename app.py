@@ -245,7 +245,7 @@ site_fc = lambda l: {"type": "FeatureCollection",
 
 
 def legend_rows(layers):
-    return [r for l in layers for r in [(l["name"], COLORS[0], 1, l["dash"], l.get("pts", False))] +
+    return [r for l in layers for r in [(l["name"], COLORS[0], .5, l["dash"], l.get("pts", False))] +
             [(b["label"], buf_color(i, len(l["bufs"]), l.get("cols", COLORS)), 2, l["dash"], False) for i, b in enumerate(l["bufs"])]]
 
 
@@ -671,20 +671,23 @@ def put_text(d, xy, s, font, anchor="la"):
 
 
 def center_text(d, s, cx, cy, w, h, size, bold=False):
-    while size > 6:
-        f = get_font(size, bold)
-        t = "\n".join(textwrap.wrap(s, max(8, int(w / (size * 0.52)))))
-        bb = d.multiline_textbbox((0, 0), t, font=f, spacing=size * .2, align="center")
-        if bb[2] <= w and bb[3] <= h:
+    s = " ".join(s.split())
+    for sz in range(size, 5, -1):
+        f, sp = get_font(sz, bold), sz * .2
+        lines, cur = [], ""
+        for word in s.split(" "):
+            t = (cur + " " + word).strip()
+            if not cur or d.textlength(t, font=f) <= w:
+                cur = t
+            else:
+                lines.append(cur)
+                cur = word
+        t = "\n".join(lines + [cur])
+        bb = d.multiline_textbbox((0, 0), t, font=f, spacing=sp, align="center")
+        if bb[2] - bb[0] <= w and bb[3] - bb[1] <= h:
             break
-        size -= 1
-    else:
-        f, t = get_font(6), s
-    sp = size * .2
-    try:
-        d.multiline_text((cx, cy), t, font=f, fill="black", anchor="mm", align="center", spacing=sp)
-    except ValueError:
-        d.multiline_text((cx - w / 2, cy - h / 2), t, font=f, fill="black", align="center", spacing=sp)
+    d.multiline_text((cx - (bb[0] + bb[2]) / 2, cy - (bb[1] + bb[3]) / 2), t, font=f, fill="black",
+                     align="center", spacing=sp)
 
 
 def prepared_by(img, d, cx, ya, yb, w, size, logo_bytes, logo_h):
@@ -979,7 +982,7 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     vec, wm = [], []
     for l in layers:
         dash, n_, cols = ((pt(6), pt(4)) if l["dash"] else None), len(l["bufs"]), l.get("cols", COLORS)
-        for geoms, c, lw in [(b["gj"], buf_color(i, n_, cols), 2) for i, b in enumerate(l["bufs"])] + [(l["site"], COLORS[0], 1)]:
+        for geoms, c, lw in [(b["gj"], buf_color(i, n_, cols), 2) for i, b in enumerate(l["bufs"])] + [(l["site"], COLORS[0], .5)]:
             for g in geoms:
                 for path in geom_paths(g):
                     pts_ = [tp(x, y) for x, y in path]
@@ -1033,8 +1036,9 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     sep = min(.5 if topo else .46 if has_dem else .22, .672 - .03 * nrow + .02)
     for v in (.905, .74, sep):
         d.line([(px0, PY(v)), (px1, PY(v))], fill="black", width=pt(1))
-    put_text(d, (PX(.5), PY(.88)), "Title :", get_font(pt(11.5), True), "mm")
-    center_text(d, title.replace("\n", " "), PX(.5), PY(.8225), pw * .94, (PY(.74) - PY(.905)) * .9, pt(15))
+    tt, tb = PY(.905), PY(.74)
+    put_text(d, (PX(.5), tt + (tb - tt) * .13), "Title :", get_font(pt(11.5), True), "mm")
+    center_text(d, title, PX(.5), tt + (tb - tt) * .58, pw * .88, (tb - tt) * .62, pt(15))
 
     put_text(d, (PX(.5), PY(.715)), "Legends", get_font(pt(13), True), "mm")
     f_leg, y = get_font(pt(11)), .672
@@ -2214,7 +2218,7 @@ C.layers.forEach(lay => {
   lay.bufs.forEach((b, i) => grow(L.geoJSON(b.gj, {style: {color: cols[i == 0 ? 0 : i == n - 1 ? 2 : 1], weight: 2.5, dashArray: dash, fill: false},
     pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon})}).bindTooltip(b.label, {sticky: true}).addTo(siteG)));
   grow(L.geoJSON(lay.fc, {
-    style: {color: C.colors[0], weight: 2, dashArray: dash, fill: true, fillOpacity: 0},
+    style: {color: C.colors[0], weight: 1.5, dashArray: dash, fill: true, fillOpacity: 0},
     pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon}),
     onEachFeature: (f, layer) => {
       const p = f.properties || {};

@@ -61,6 +61,13 @@ BASEMAPS = {"White": None,
             "Esri Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"}
 SAT_BASE = BASEMAPS["Google Satellite"]
 TERRAIN_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+
+
+SITE_W = .8   # project-site line thickness (points) - used by export legend, export map and live map
+TITLE_HEAD_FS, TITLE_FS = 16, 22  # "Title :" label / project name (starting size, auto-shrinks to fit)
+LEG_HEAD_FS, LEG_FS = 18, 14       # "Legends" heading / legend row text
+
+
 DEM_PAL = ["#ffffd4", "#fed98e", "#fe9929", "#d95f0e", "#993404"]
 DEM_SRC = "NASA SRTM 30 meter Digital Elevation"
 ROAD_SRC, ROAD_COL = "Survey of India", "#8b4513"
@@ -245,7 +252,7 @@ site_fc = lambda l: {"type": "FeatureCollection",
 
 
 def legend_rows(layers):
-    return [r for l in layers for r in [(l["name"], COLORS[0], .5, l["dash"], l.get("pts", False))] +
+    return [r for l in layers for r in [(l["name"], COLORS[0], SITE_W, l["dash"], l.get("pts", False))] +
             [(b["label"], buf_color(i, len(l["bufs"]), l.get("cols", COLORS)), 2, l["dash"], False) for i, b in enumerate(l["bufs"])]]
 
 
@@ -982,7 +989,7 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     vec, wm = [], []
     for l in layers:
         dash, n_, cols = ((pt(6), pt(4)) if l["dash"] else None), len(l["bufs"]), l.get("cols", COLORS)
-        for geoms, c, lw in [(b["gj"], buf_color(i, n_, cols), 2) for i, b in enumerate(l["bufs"])] + [(l["site"], COLORS[0], .5)]:
+        for geoms, c, lw in [(b["gj"], buf_color(i, n_, cols), 2) for i, b in enumerate(l["bufs"])] + [(l["site"], COLORS[0], SITE_W)]:
             for g in geoms:
                 for path in geom_paths(g):
                     pts_ = [tp(x, y) for x, y in path]
@@ -1037,11 +1044,11 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     for v in (.905, .74, sep):
         d.line([(px0, PY(v)), (px1, PY(v))], fill="black", width=pt(1))
     tt, tb = PY(.905), PY(.74)
-    put_text(d, (PX(.5), tt + (tb - tt) * .13), "Title :", get_font(pt(11.5), True), "mm")
-    center_text(d, title, PX(.5), tt + (tb - tt) * .58, pw * .88, (tb - tt) * .62, pt(15))
+    put_text(d, (PX(.5), tt + (tb - tt) * .13), "Title :", get_font(pt(TITLE_HEAD_FS), True), "mm")
+    center_text(d, title, PX(.5), tt + (tb - tt) * .58, pw * .88, (tb - tt) * .62, pt(TITLE_FS))
 
-    put_text(d, (PX(.5), PY(.715)), "Legends", get_font(pt(13), True), "mm")
-    f_leg, y = get_font(pt(11)), .672
+    put_text(d, (PX(.5), PY(.715)), "Legends", get_font(pt(LEG_HEAD_FS), True), "mm")
+    f_leg, y = get_font(pt(LEG_FS)), .672
     if not (topo or has_dem) and nrow:
         y = min(.672, (.69 + sep) / 2 + (.03 * (nrow - 1) + .02) / 2 - .02)
     for lab, c, lw, dashed, icon in rows:
@@ -2157,7 +2164,7 @@ cfg = {
     "dem": {"url": dem_ov[0], "b": dem_ov[1]} if on_dem else None,
     "contours": terr[3] if on_con else None, "con_labels": terr[5] if on_con else None,
     "roads": road_fc, "water": water or None, "wcol": {k: v[2] for k, v in DRAIN.items()},
-    "cc": CON_COL, "rc": ROAD_COL, "vbc": VS_BUF_COL,
+    "cc": CON_COL, "rc": ROAD_COL, "vbc": VS_BUF_COL, "sw": SITE_W,
 }
 if vp:
     cfg["sig"] += "|vs"
@@ -2217,8 +2224,8 @@ C.layers.forEach(lay => {
   const grow = g => { all = all ? all.extend(g.getBounds()) : g.getBounds(); };
   lay.bufs.forEach((b, i) => grow(L.geoJSON(b.gj, {style: {color: cols[i == 0 ? 0 : i == n - 1 ? 2 : 1], weight: 2.5, dashArray: dash, fill: false},
     pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon})}).bindTooltip(b.label, {sticky: true}).addTo(siteG)));
-  grow(L.geoJSON(lay.fc, {
-    style: {color: C.colors[0], weight: 1.5, dashArray: dash, fill: true, fillOpacity: 0},
+    grow(L.geoJSON(lay.fc, {
+    style: {color: C.colors[0], weight: Math.max(C.sw * 2.4, 0.8), dashArray: dash, fill: true, fillOpacity: 0},
     pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon}),
     onEachFeature: (f, layer) => {
       const p = f.properties || {};

@@ -61,7 +61,7 @@ BASEMAPS = {"White": None,
             "Esri Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"}
 SAT_BASE = BASEMAPS["Google Satellite"]
 TERRAIN_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
-
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
 SITE_W = .8   # project-site line thickness (points) - used by export legend, export map and live map
 TITLE_HEAD_FS, TITLE_FS = 16, 22  # "Title :" label / project name (starting size, auto-shrinks to fit)
@@ -659,11 +659,14 @@ unmerc = lambda x, y: (math.degrees(x / R), math.degrees(math.atan(math.sinh(y /
 
 
 def get_font(size, bold=False):
-    for n in (["arialbd.ttf", "DejaVuSans-Bold.ttf"] if bold else ["arial.ttf", "DejaVuSans.ttf"]):
-        try:
-            return ImageFont.truetype(n, size)
-        except Exception:
-            pass
+    names = (["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "arialbd.ttf"] if bold
+             else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "arial.ttf"])
+    for n in names:
+        for p in (os.path.join(FONT_DIR, n), n):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
     try:
         return ImageFont.load_default(size)
     except TypeError:

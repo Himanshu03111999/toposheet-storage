@@ -3,6 +3,8 @@ Geospatial Site Analysis & Mapping Dashboard - single file.   Run: streamlit run
 Needs: streamlit requests geopandas shapely>=2 pyproj pillow>=10.1 pmtiles numpy contourpy mapbox-vector-tile huggingface_hub hf_xet
        opencv-python-headless pymupdf tifffile (the last few auto-install when needed).
 Data: HF dataset himanshuguptta/geotiff-hub (HF_TOKEN), byte-range reads. R2_BASE (env/secret): toposheets from R2 first.
+Topo: whole SOI-OSM-50k parts (part0000 = z0-12 all India, part0001-5 = z13-14 longitude strips) are loaded automatically.
+Villages: bhuvan_villages.pmtiles (viewer only).
 Workers: "--export <dir>" (PNG) and "--georef <dir>" (PDF/GeoTIFF -> PMTiles).
 Optional: .streamlit/config.toml -> [server] enableStaticServing = true gives a live tile preview of fresh sheets (else a JPEG preview is used).
 """
@@ -44,7 +46,8 @@ R2_BASE = (os.getenv("R2_BASE") or "").rstrip("/")
 TILE_WORKERS, JOB_TTL, LIST_TTL, WATCH_EVERY = 32, 1800, 20, 30
 GEO_MIN_ZOOM, GEO_QUALITY, GEO_TTL, GEO_DPI = 6, 90, 3 * 3600, 200
 R = 6378137.0
-COLORS = ["#000000", "#d00000", "#0057ff"]
+COLORS = ["#000000", "#d00000", "#0057ff", "#00a651", "#ff7a00"]   # buffer 1..5
+V2_COLS = ["#000000", "#d00000", "#0057ff", "#00a651", "#8e44ad", "#ff7a00"]   # default colours for Vector 2 files (first = black)
 DPI_OPTIONS = [300, 500, 800]
 LOGO_SCALE, LOGO_H_PT, PREVIEW_PX = 0.6, 100, 3200
 STATIC_GEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "geo")
@@ -64,6 +67,7 @@ TERRAIN_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
 SITE_W = .8   # project-site line thickness (points) - used by export legend, export map and live map
+V2_EXP_W = 2.0   # export only: Vector 2 line thickness (points). 2.0 = same as Vector 1 buffer lines
 TITLE_HEAD_FS, TITLE_FS = 16, 22  # "Title :" label / project name (starting size, auto-shrinks to fit)
 LEG_HEAD_FS, LEG_FS = 18, 14       # "Legends" heading / legend row text
 
@@ -74,6 +78,7 @@ ROAD_SRC, ROAD_COL = "Survey of India", "#8b4513"
 WATER_SRC = ("Bhuvan LULC-10k:SIS-DP Phase 2 (2018-23) datasets rectified with current "
              "Google Earth Imagery (2025-26)")
 SAT_SRC = "Google Earth Imagery"
+VIL_COL = "#fff200"
 DRAIN = {"canal": ("Canal / Drain", "canal_drain", "#00897b"),
          "lake": ("Lake / Pond", "lake_pond", "#29b6f6"),
          "river": ("River / Stream", "river_stream", "#1f4fd8"),
@@ -81,7 +86,7 @@ DRAIN = {"canal": ("Canal / Drain", "canal_drain", "#00897b"),
 tint = lambda c, a=.45: "#" + "".join(f"{int(255 - (255 - int(c[i:i + 2], 16)) * a):02x}" for i in (1, 3, 5))
 norm = lambda s: re.sub(r"[\s_\-]+", "", s.lower())
 stem_of = lambda k: norm(os.path.splitext(k)[0])
-is_vec = lambda k: stem_of(k).startswith("roads") or stem_of(k) in {norm(v[1]) for v in DRAIN.values()}
+is_vec = lambda k: stem_of(k).startswith(("roads", "bhuvanvillages")) or stem_of(k) in {norm(v[1]) for v in DRAIN.values()}
 WM_SVG = ('<svg width="22" height="14" viewBox="-17 -11 34 22" style="flex:none"><path d="M0 -2L0 -11M0 -2L-7.8 2.5M0 -2L7.8 2.5M0 -2L0 10" '
           'stroke="#000" stroke-width="1.8" stroke-linecap="round" fill="none"/><circle cx="0" cy="-2" r="2" fill="#000"/></svg>')
 CON_COL = "#707070"
@@ -226,7 +231,8 @@ def parse_buffers(txt):
 
 
 fmt_m = lambda m: f"{m / 1000:g}km" if m >= 1000 else f"{m:g}m"
-buf_color = lambda i, n, cols=COLORS: cols[0 if i == 0 else 2 if i == n - 1 else 1]
+buf_color = lambda i, n, cols=COLORS: cols[min(i, len(cols) - 1)]   # buffer k uses colour k (more than 5 buffers reuse the last colour)
+fmt_sheet = lambda k: re.sub(r"^(\d{1,3}[A-P])0*(\d+)$", r"\1/\2", k)   # 56G05 -> 56G/5; other names unchanged
 
 
 def default_labels(i, bufs):
@@ -236,6 +242,8 @@ def default_labels(i, bufs):
 
 
 def make_layer(g, labels, buf_m, dash):
+    g = g.copy()
+    g["geometry"] = g.geometry.apply(shapely.force_2d)   # KML/GeoJSON often carry Z; drop it
     u = g.to_crs(g.estimate_utm_crs())
     one = unary_union(list(u.geometry))
     gj = lambda geom: json.loads(gpd.GeoSeries([geom], crs=u.crs).to_crs(4326).to_json())
@@ -252,7 +260,7 @@ site_fc = lambda l: {"type": "FeatureCollection",
 
 
 def legend_rows(layers):
-    return [r for l in layers for r in [(l["name"], COLORS[0], SITE_W, l["dash"], l.get("pts", False))] +
+                return [r for l in layers for r in [(l["name"], l.get("scol", COLORS[0]), SITE_W, l["dash"], l.get("pts", False))] +
             [(b["label"], buf_color(i, len(l["bufs"]), l.get("cols", COLORS)), 2, l["dash"], False) for i, b in enumerate(l["bufs"])]]
 
 
@@ -310,8 +318,30 @@ def to_kml(name, feats, color="#000000", width=2):
     return ('<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2">'
             f'<Document><name>{escape(name)}</name>{"".join(placemark(*f) for f in feats)}</Document></kml>')
 
+def villages_kml(feats, color=VIL_COL, width=2):
+    """feats = [(name, polygon geometry in lon/lat, properties)] -> KML with yellow boundary + labelled centroid point."""
+    c = "ff" + color[5:7] + color[3:5] + color[1:3]          # KML is aabbggrr
+    geoms = gpd.GeoSeries([g for _, g, _ in feats], crs=4326)
+    cents = geoms.to_crs(geoms.estimate_utm_crs()).centroid.to_crs(4326)   # true centroid (computed in metres)
+    poly_sty = (f"<Style><LineStyle><color>{c}</color><width>{width}</width></LineStyle>"
+                "<PolyStyle><fill>0</fill></PolyStyle></Style>")
+    pt_sty = (f"<Style><IconStyle><color>{c}</color><scale>.7</scale><Icon><href>"
+              "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle>"
+              f"<LabelStyle><color>{c}</color><scale>.9</scale></LabelStyle></Style>")
 
-# ---------------- roads / water / DEM / contours ----------------
+    def ext(props):
+        e = "".join(f'<Data name="{escape(str(k), {chr(34): "&quot;"})}"><value>{escape(str(v))}</value></Data>'
+                    for k, v in props.items() if v not in (None, ""))
+        return f"<ExtendedData>{e}</ExtendedData>" if e else ""
+
+    marks = []
+    for (n, g, props), q in zip(feats, cents):
+        marks.append(f"<Placemark><name>{escape(n)}</name>{poly_sty}{ext(props)}{kml_geom(g)}</Placemark>")
+        marks.append(f"<Placemark><name>{escape(n)}</name>{pt_sty}{ext(props)}"
+                     f"<Point><coordinates>{q.x:.6f},{q.y:.6f},0</coordinates></Point></Placemark>")
+    return ('<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2">'
+            f'<Document><name>Bhuvan Villages</name>{"".join(marks)}</Document></kml>')
+# ---------------- roads / water / villages / DEM / contours ----------------
 def to_fc(g, cols=()):
     rnd = lambda c: [round(c[0], 5), round(c[1], 5)] if isinstance(c[0], float) else [rnd(p) for p in c]
     return {"type": "FeatureCollection", "features": [
@@ -337,18 +367,19 @@ def tile_range(b, z):
     return n, max(x0, 0), min(x1, n - 1), max(y0, 0), min(y1, n - 1)
 
 
-def read_vt(path, ou_wkb, kinds):
+def vt_tiles(path, bounds):
+    """Open a vector PMTiles and pick a zoom with <= 300 tiles over `bounds` -> (decode fn, n, z, tile list)."""
     mvt = ensure("mapbox_vector_tile", "mapbox-vector-tile")
-    ou, rd = swkb.loads(ou_wkb), reader(path)
+    rd = reader(path)
     h = rd.header()
     z = h["max_zoom"]
     while True:
-        n, x0, x1, y0, y1 = tile_range(ou.bounds, z)
+        n, x0, x1, y0, y1 = tile_range(bounds, z)
         if z <= h["min_zoom"] or (x1 - x0 + 1) * (y1 - y0 + 1) <= 300:
             break
         z -= 1
 
-    def one(xy):
+    def decode(xy):  # -> [(properties, geometry in lon/lat)]
         x, y = xy
         data = rd.get(z, x, y)
         if data and data[:2] == b"\x1f\x8b":
@@ -358,12 +389,17 @@ def read_vt(path, ou_wkb, kinds):
             e = ly.get("extent", 4096)
             ll = lambda c: np.column_stack(((x + c[:, 0] / e) / n * 360 - 180,
                                             np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * (y + c[:, 1] / e) / n))))))
-            out += [shapely.transform(shape(f["geometry"]), ll) for f in ly["features"]]
+            out += [(f.get("properties") or {}, shapely.transform(shape(f["geometry"]), ll)) for f in ly["features"]]
         return out
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        parts = [g for r in ex.map(one, [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]) for g in r]
-    groups = [[make_valid(g) for g in parts if any(t in g.geom_type for t in tp)]
+        return [pg for r in ex.map(decode, [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]) for pg in r]
+
+
+def read_vt(path, ou_wkb, kinds):
+    ou = swkb.loads(ou_wkb)
+    parts = [make_valid(g) for _, g in vt_tiles(path, ou.bounds)]
+    groups = [[g for g in parts if any(t in g.geom_type for t in tp)]
               for k, tp in (("LineString", ("LineString",)), ("Polygon", ("Polygon",))) if k in kinds]
     geoms = [unary_union(gr) for gr in groups if gr]
     if not geoms:
@@ -374,6 +410,24 @@ def read_vt(path, ou_wkb, kinds):
 
 build_roads = lambda path, ou_wkb, v=None: read_vt(path, ou_wkb, ("LineString",))
 build_water = lambda path, ou_wkb, v=None: read_vt(path, ou_wkb, ("Polygon", "LineString"))
+
+
+def build_villages(path, ou_wkb, v=None):
+    """Whole village polygons (with attributes) that intersect the outermost buffer."""
+    ou = swkb.loads(ou_wkb)
+    grp = {}
+    for p, g in vt_tiles(path, ou.buffer(.03).bounds):
+        if "Polygon" in g.geom_type:   # a village cut by tile edges is merged back by its attributes
+            grp.setdefault(json.dumps(p, sort_keys=True, default=str), (p, []))[1].append(make_valid(g))
+    items = [(p, unary_union(gs)) for p, gs in grp.values()]
+    items = [(p, g) for p, g in items if g.intersects(ou)]
+    if not items:
+        return None
+    df = gpd.GeoDataFrame([p for p, _ in items], geometry=[g for _, g in items], crs=4326)
+    cols = [c for c in df.columns if c != "geometry"]
+    if cols:
+        df[cols] = df[cols].fillna("").astype(str)
+    return to_fc(df, cols)
 
 
 def contour_label_points(g, lens_m, step=LABEL_STEP, per=3000, cap=1500):
@@ -419,8 +473,10 @@ def build_terrain(ou_wkb):
     m = Image.new("L", e.shape[::-1], 0)
     dm = ImageDraw.Draw(m)
     for pg in getattr(om, "geoms", [om]):
+        if pg.geom_type != "Polygon":
+            continue
         for ring, v in [(pg.exterior, 255)] + [(r, 0) for r in pg.interiors]:
-            dm.polygon([((x - X0) / p, (Y1 - y) / p) for x, y in ring.coords], fill=v)
+                        dm.polygon([((c[0] - X0) / p, (Y1 - c[1]) / p) for c in ring.coords], fill=v)
     zi = np.where(np.asarray(m) > 0, e, np.nan).astype("float32")
     v = zi[~np.isnan(zi)]
     if not v.size:
@@ -617,7 +673,7 @@ def mosaic(src, bounds, max_tiles, on_tile=None):
         z -= 1
         n, x0, x1, y0, y1 = tile_range(bounds, z)
     if z == zmin and zmin > 8 and (x1 - x0 + 1 > max_tiles or y1 - y0 + 1 > max_tiles):
-        return None
+        return None   # detail part (z13+) is too coarse-extent for this export; the all-India part covers it
     canvas = Image.new("RGBA", ((x1 - x0 + 1) * 256, (y1 - y0 + 1) * 256), (0, 0, 0, 0))
     tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
@@ -994,7 +1050,8 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
     vec, wm = [], []
     for l in layers:
         dash, n_, cols = ((pt(6), pt(4)) if l["dash"] else None), len(l["bufs"]), l.get("cols", COLORS)
-        for geoms, c, lw in [(b["gj"], buf_color(i, n_, cols), 2) for i, b in enumerate(l["bufs"])] + [(l["site"], COLORS[0], SITE_W)]:
+        for geoms, c, lw in [(b["gj"], buf_color(i, n_, cols), 2) for i, b in enumerate(l["bufs"])] + \
+                    [(l["site"], l.get("scol", COLORS[0]), V2_EXP_W if l.get("v2") else SITE_W)]:
             for g in geoms:
                 for path in geom_paths(g):
                     pts_ = [tp(x, y) for x, y in path]
@@ -1061,7 +1118,7 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
         if icon:
             draw_windmill(d, (x0_ + x1_) / 2, (y0_ + y1_) / 2 - ph * .006, ph * .011)
         else:
-            draw_path(d, [(x0_, y0_), (x1_, y0_), (x1_, y1_), (x0_, y1_), (x0_, y0_)], c, pt(lw), (pt(6), pt(4)) if dashed else None)
+                        draw_path(d, [(x0_, y0_), (x1_, y0_), (x1_, y1_), (x0_, y1_), (x0_, y0_)], c, pt(lw), (pt(6), pt(4)) if dashed else None)
         put_text(d, (PX(.22), PY(y + .01)), lab, f_leg, "lm")
         y -= .03
     for lab, c, lw, sty in lrows:
@@ -1435,6 +1492,7 @@ release_assets = st.cache_data(ttl=LIST_TTL, show_spinner=False)(list_assets)
 terrain = st.cache_resource(show_spinner="Loading...", max_entries=3)(build_terrain)
 road_data = st.cache_resource(show_spinner="Loading...", max_entries=4)(build_roads)
 water_data = st.cache_resource(show_spinner="Loading...", max_entries=8)(build_water)
+village_data = st.cache_resource(show_spinner="Loading...", max_entries=4)(build_villages)
 vs_data = st.cache_resource(show_spinner="Loading...", max_entries=2)(vantage_batches)
 
 st.markdown("""<style>
@@ -1456,8 +1514,6 @@ html,body,[class*="css"],.stMarkdown,p,span,label{font-size:12px!important}
 .hd .ic{font-size:26px}
 .hd b{display:block;color:var(--g);font-size:19px!important;font-weight:800;line-height:1.2}
 .hd small{display:block;color:#6b705f;font-size:11px!important;line-height:1.3}
-.pillw{display:flex;justify-content:center}
-.pill{white-space:nowrap;background:#eef3ea;color:var(--g);border:1px solid var(--moss);border-radius:20px;padding:4px 14px;font-size:11.5px!important;font-weight:600}
 /* ---- tabs: one compact line, Contribute pinned to the far right corner ---- */
 .stTabs [data-baseweb="tab-list"]{display:flex;flex-wrap:nowrap;width:100%;gap:2px;border-bottom:2px solid var(--moss);overflow-x:auto;scrollbar-width:thin}
 .stTabs [data-baseweb="tab"]{flex:none;height:32px;padding:0 9px;border-radius:8px 8px 0 0;color:#5d6657;white-space:nowrap}
@@ -1492,12 +1548,12 @@ div[data-baseweb="select"]>div,div[data-baseweb="input"],div[data-baseweb="base-
 .custom-footer a{color:var(--g);text-decoration:none}
 .sec{font-weight:700;font-size:14px!important;color:var(--g);border-left:4px solid var(--acc);padding-left:8px;margin:6px 0}
 @media(max-width:700px){.block-container{padding:.4rem .5rem!important}.hd small{display:none}.hd b{font-size:15px!important}
-  .pillw{justify-content:flex-start}.stTabs [data-baseweb="tab-panel"]{padding:8px}}
+  .stTabs [data-baseweb="tab-panel"]{padding:8px}}
 </style>""", unsafe_allow_html=True)
 
 with st.container(key="hdr"):
-    _h1, _h2, _h3, _h4 = st.columns([4.6, 2.4, 1.7, 1.0], vertical_alignment="center")
-    hdr_slot, pill_slot = _h1.empty(), _h2.empty()
+    _h1, _h3, _h4 = st.columns([6.8, 1.7, 1.0], vertical_alignment="center")
+    hdr_slot = _h1.empty()
     basemap = _h3.selectbox("Base map", list(BASEMAPS), index=2, label_visibility="collapsed", format_func=lambda k: "🗺️ " + k)
     if _h4.button("🚪 Log out", width="stretch"):
         st.session_state["auth"] = False
@@ -1657,14 +1713,6 @@ def osm_sheet_table(v):
 def match_sheet(filename, table):
     return next(((c.upper(), table[c.upper()]) for c in re.findall(r"[A-Za-z0-9]+", os.path.splitext(filename)[0])
                  if c.upper() in table), None)
-
-fmt_sheet = lambda k: re.sub(r"^(\d{1,3}[A-P])0*(\d+)$", r"\1/\2", k)   # 56G05 -> 56G/5; unchanged if the name has another pattern
-def sheet_no(name):
-    s = re.findall(r"\d{1,3}[A-P]/?\d{1,2}", name, re.I)
-    if not s:
-        return None
-    s = s[0].upper()
-    return s if "/" in s else re.sub(r"([A-P])(\d+)", r"\1/\2", s)
 
 
 def describe_exit(rc):
@@ -1887,6 +1935,8 @@ def watch_hf():
 
 watch_hf()
 pm_assets = {n: i for n, i in assets.items() if n.lower().endswith(".pmtiles") and not is_vec(n)}
+# whole topo: the SOI-OSM-50k parts are always loaded (no sheet selector); falls back to every .pmtiles if none are present
+chosen = [n for n in pm_assets if "soiosm" in stem_of(n)] or list(pm_assets)
 
 _ver = lambda *keys: tuple(sorted((k, _S.sig.get(p)) for k, p in assets.items() if any(w in k.lower() for w in keys)))
 leg_bytes = sticky(("legend", _ver("legend_t")), lambda: legend_image(assets))
@@ -1895,8 +1945,7 @@ hdr_slot.markdown(
     '<div class="hd">' + (f'<img src="data:image/jpeg;base64,{base64.b64encode(logo_bytes).decode()}">' if logo_bytes
                           else '<span class="ic">🛰️</span>') +
     f'<div><b>{APP_TITLE}</b><small>Site boundaries &amp; buffer zones &middot; Toposheets &middot; DEM &amp; contours &middot; '
-    'Roads &middot; Surface water &middot; Satellite &middot; Vantage points</small></div></div>', unsafe_allow_html=True)
-pill_slot.markdown(f'<div class="pillw"><span class="pill">● {len(pm_assets)} toposheets in library</span></div>', unsafe_allow_html=True)
+    'Roads &middot; Surface water &middot; Villages &middot; Satellite &middot; Vantage points</small></div></div>', unsafe_allow_html=True)
 
 project_title = st.text_input(
     "Project Title",
@@ -1913,7 +1962,8 @@ geo_busy = bool(gjob) and (gjob["status"] == "running" or (gjob.get("push") or {
 
 # ---------------- controls ----------------
 T = st.tabs(["📍 Site vectors", "🧭 Georeferencing", "🗾 Toposheet viewer", "💧 Drainage", "⛰️ DEM & Contour",
-             "🛣️ Roads & Transportation", "🛰️ Satellite map", "🎯 Vantage-Point Selection", "🤝 Contribute"])
+             "🛣️ Roads & Transportation", "🛰️ Satellite map", "🏘️ Bhuvan Village Boundary", "🎯 Vantage-Point Selection",
+             "🤝 Contribute"])
 notes = st.container()
 st.markdown('<div class="sec">Live map</div>', unsafe_allow_html=True)
 
@@ -1943,8 +1993,6 @@ with T[1]:
                     seen.add(stem)
                     items.append({"name": stem, "bounds": list(hit[1]) if hit else None, "data": f.getvalue(),
                                   "ext": ".tif" if is_tif else ".pdf"})
-            if have:
-                st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | set(have))
             if items:
                 _old = st.session_state.get("geo_id")
                 kill_job(GEO.pop(_old, None))
@@ -1956,21 +2004,13 @@ with T[1]:
                 st.rerun()
             elif bad:
                 st.error("No PDF name matches a sheet: " + ", ".join(bad))
-            else:
-                st.rerun()
+            elif have:
+                st.info("Already in the library: " + ", ".join(have))
 
 with T[2]:
-    _pend = st.session_state.get("geo_select", [])
-    if any(n in pm_assets for n in _pend):
-        st.session_state["chosen"] = sorted(set(st.session_state.get("chosen", [])) | {n for n in _pend if n in pm_assets})
-        st.session_state["geo_select"] = [n for n in _pend if n not in pm_assets]
-    b1, b2, b3 = st.columns([1, 1, 3])
-    if b1.button("Select all", width="stretch"):
-        st.session_state["chosen"] = list(pm_assets)
-    if b2.button("Clear", width="stretch"):
-        st.session_state["chosen"] = []
-    show_topo = b3.toggle("🗾 Show topo layer on the map", value=True)
-    chosen = st.multiselect(f"Toposheets in the database ({len(pm_assets)})", list(pm_assets), key="chosen")
+    show_topo = st.toggle("🗾 Show topo layer on the map", value=False)
+    st.caption("The whole SOI OSM 50k series loads automatically. Part 0000 covers all India up to zoom 12; "
+               "the detailed strips (parts 0001-0005) appear from zoom 13.")
 
 with T[3]:
     show_dr = {k: col.toggle(f"💧 {v[0]}", value=False) for col, (k, v) in zip(st.columns(4), DRAIN.items())}
@@ -1990,32 +2030,55 @@ with T[6]:
     st.markdown("**Satellite map**: Google Satellite imagery inside the outermost buffer, white outside, with the site and buffers on top.")
     st.caption("Choose *Satellite Map* under Export Map once a site vector is loaded. For the live map use the Base map selector in the header.")
 
+with T[7]:
+    show_vil = st.toggle("🏘️ Show Bhuvan Village Boundary", value=False)
+    st.caption("Only villages intersecting the outermost buffer are shown. Viewer only (not in the map export). "
+               "Hover a village for its attributes. Needs a site vector + buffer.")
+    vil_dl = st.empty()
+
 layers, sig = [], []
+VEC_TYPES = ["geojson", "kml", "gpx", "zip"]
 with T[0]:
-    for i, col in zip((1, 2), st.columns(2)):
-        with col:
-            vf = st.file_uploader(f"Vector {i} (.geojson, .kml, .zip)", type=["geojson", "kml", "gpx", "zip"], key=f"vec{i}")
-            tb, pkc = st.columns([6, 1.4], vertical_alignment="bottom")
-            bt = tb.text_input(f"Vector {i} buffers (e.g. 2km, 5km, 10km)", "2km, 5km, 10km" if i == 1 else "2km", key=f"buf{i}")
-            with pkc, st.container(key=f"pk{i}"):   # three small colour dots, tight spacing
-                cols_ = [p.color_picker("c", COLORS[k], key=f"bc{i}{k}", label_visibility="collapsed",
-                                        help=("Inner", "Middle", "Outer")[k] + " buffer colour")
-                         for k, p in enumerate(st.columns(3))]
-            bm = parse_buffers(bt)
-            dl = default_labels(i, bm)
-            lt = st.text_input(f"Vector {i} legend text (comma separated: site, then each buffer)", ", ".join(dl), key=f"lab{i}_{bt}")
-            lab = [x.strip() for x in lt.split(",")]
-            labels = [lab[k] if k < len(lab) and lab[k] else d for k, d in enumerate(dl)]
-            if vf:
-                try:
-                    layers.append(layer_for(vf.name, vf.getvalue(), tuple(bm), tuple(labels), i == 2, tuple(cols_)))
-                    sig.append(vf.name)
-                except Exception as e:
-                    st.error(f"Vector {i} error: {e}")
+    c_v1, c_v2 = st.columns(2)
+    # ---- Vector 1: project site + buffers (up to 5 colours) ----
+    with c_v1:
+        vf = st.file_uploader("Vector 1 (.geojson, .kml, .zip)", type=VEC_TYPES, key="vec1")
+        tb, pkc = st.columns([4, 2.6], vertical_alignment="bottom")
+        bt = tb.text_input("Vector 1 buffers (e.g. 2km, 5km, 10km, 20km)", "2km, 5km, 10km", key="buf1")
+        with pkc, st.container(key="pk1"):
+            cols_ = [p.color_picker("c", COLORS[k], key=f"bc1{k}", label_visibility="collapsed", help=f"Buffer {k + 1} colour")
+                     for k, p in enumerate(st.columns(5))]
+        bm = parse_buffers(bt)
+        dl = default_labels(1, bm)
+        lt = st.text_input("Vector 1 legend text (comma separated: site, then each buffer)", ", ".join(dl), key=f"lab1_{bt}")
+        lab = [x.strip() for x in lt.split(",")]
+        labels = [lab[k] if k < len(lab) and lab[k] else d for k, d in enumerate(dl)]
+        if vf:
+            try:
+                layers.append(layer_for(vf.name, vf.getvalue(), tuple(bm), tuple(labels), False, tuple(cols_)))
+                sig.append(vf.name)
+            except Exception as e:
+                st.error(f"Vector 1 error: {e}")
+    # ---- Vector 2: any number of files (transmission lines etc.), no buffers, own legend text + colour ----
+    with c_v2:
+        v2fs = st.file_uploader("Vector 2 - transmission line / other files (one or more)", type=VEC_TYPES,
+                                accept_multiple_files=True, key="vec2")
+        for n, f in enumerate(v2fs or []):
+            dflt = "Transmission Line" if len(v2fs) == 1 else os.path.splitext(f.name)[0]
+            tcol, pcol = st.columns([6, 1], vertical_alignment="bottom")
+            nm = tcol.text_input(f"Legend text - {f.name}", dflt, key=f"v2lab{n}_{f.name}_{dflt}").strip() or dflt
+            colr = pcol.color_picker("c", V2_COLS[n % len(V2_COLS)], key=f"v2c{n}_{f.name}", label_visibility="collapsed",
+                                     help="Line colour")
+            try:
+                l = layer_for(f.name, f.getvalue(), (), (nm,), n > 0, tuple(COLORS))   # first file solid, the rest dashed
+                layers.append(dict(l, scol=colr, v2=True, key=f"{l['key']}|{colr}"))
+                sig.append(f.name)
+            except Exception as e:
+                st.error(f"{f.name}: {e}")
 
 # ---- vantage-point selection for the WTGs (point features of Vector 1 / 2) ----
 wtg, vs_res, vs_on, vs_args = wtg_points(layers), None, [], None
-with T[7]:
+with T[8]:
     v1, v2, v3 = st.columns(3)
     vs_h = v1.number_input("Observer height (m)", 0.0, 100.0, 1.6, 0.1)
     vs_t = v2.number_input("Target height (m)", 0.0, 300.0, 0.0, 1.0)
@@ -2046,7 +2109,7 @@ with T[7]:
             st.caption("Visibility raster: the darker the colour, the more WTGs are visible from that cell.")
 vs_b = vs_res["batches"][:1] if vs_res else []   # map / legend / table: Batch 1 only (Deliverables export all batches)
 
-with T[8]:
+with T[9]:
     cfs = st.file_uploader("Any file: toposheet, GeoTIFF, vector, PNG, PDF, ...", accept_multiple_files=True, key="contrib")
     if cfs and st.button("Submit contribution"):
         wt = write_token()
@@ -2069,32 +2132,21 @@ if show_osm_index:
         notes.error(f"OSM index: {e}")
 
 outer = [shape(f["geometry"]) for l in layers for f in (l["bufs"][-1]["gj"] if l["bufs"] else l["site"])["features"]]
-if outer and chosen:
-    with ThreadPoolExecutor(max_workers=8) as _ex:
-        list(_ex.map(sheet_bounds, [pm_assets[n] for n in chosen]))
-
-
-def touches_buffer(name):
-    b = sheet_bounds(pm_assets[name])
-    return True if b is None else any(g.intersects(box(*b)) for g in outer)
-
-
-sheets_str = ""
-if outer:   # sheet numbers only when a vector is loaded: OSM index sheets that touch the outermost buffer
+sheets_str = "-"   # topo sheet numbers: OSM-index sheets touching the outermost buffer (only once a vector is loaded)
+if outer:
     try:
         _tbl = osm_sheet_table(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
         _u = unary_union(outer)
-        sheets_str = ", ".join(fmt_sheet(k) for k, b in sorted(_tbl.items()) if _u.intersects(box(*b)))
+        sheets_str = ", ".join(fmt_sheet(k) for k, b in sorted(_tbl.items()) if _u.intersects(box(*b))) or "-"
     except Exception as e:
         notes.error(f"Sheet index: {e}")
-sheets_str = sheets_str or "-"
 
-ou_wkb = unary_union(outer).wkb if outer else None
+ou_wkb = shapely.force_2d(unary_union(outer)).wkb if outer else None
 okey = f"{zlib.crc32(ou_wkb)}:{len(ou_wkb)}" if ou_wkb else ""
 terr = road_fc = dem_ov = None
 water, rv, wv = {}, None, {}
-if not ou_wkb and (show_roads or show_dem or show_con or any(show_dr.values())):
-    notes.warning("Roads / water / DEM / contours need a vector (Vector 1 or 2) with a buffer. Upload one first.")
+if not ou_wkb and (show_roads or show_dem or show_con or show_vil or any(show_dr.values())):
+    notes.warning("Roads / water / villages / DEM / contours need a vector (Vector 1 or 2) with a buffer. Upload one first.")
 if ou_wkb and (show_dem or show_con):
     try:
         terr = terrain(ou_wkb)
@@ -2130,6 +2182,25 @@ if ou_wkb:
                 notes.warning(f"No {lab} inside the buffer.")
         except Exception as e:
             notes.error(f"{lab} error: {e}")
+vil_fc = vv = None
+if ou_wkb and show_vil:
+    try:
+        vk = find_asset(assets, "bhuvan_villages", ".pmtiles")
+        if not vk:
+            raise FileNotFoundError("bhuvan_villages.pmtiles not found in the HF repo listing")
+        vv = _S.sig.get(vk)
+        vil_fc = village_data(vk, ou_wkb, vv)
+        if not vil_fc:
+            notes.warning("No villages inside the buffer.")
+    except Exception as e:
+        notes.error(f"Villages error: {e}")
+if vil_fc:
+    vil_dl.download_button(
+        f"⬇️ Intersecting villages ({len(vil_fc['features'])}) - KML",
+        memo(("vil2", okey, vv), lambda: villages_kml([
+            (next((str(v) for k, v in f["properties"].items() if k.lower() == "v_name" and v), "Village"),
+             shape(f["geometry"]), f["properties"]) for f in vil_fc["features"]])),
+        "bhuvan_villages_intersecting.kml", KML, width="stretch", key="vil_dl")
 on_dem, on_con, on_rd, on_wt = bool(dem_ov), bool(show_con and terr and terr[3]["features"]), bool(road_fc), bool(water)
 
 pmc = lambda n: {"name": n, "v": zlib.crc32(str(_S.sig.get(pm_assets[n])).encode()),
@@ -2149,7 +2220,6 @@ def preview_url(job, name):
 
 
 geo_local = [os.path.join(gjob["dir"], r["name"] + ".pmtiles") for r in geo_ov]
-
 if geo_ov:
     publish_static(st.session_state["geo_id"], gjob)
 
@@ -2172,8 +2242,8 @@ cfg = {
     "osm_index": osm_json, "georef": [r["pb"] for r in geo_ov], "vp": vp,
     "dem": {"url": dem_ov[0], "b": dem_ov[1]} if on_dem else None,
     "contours": terr[3] if on_con else None, "con_labels": terr[5] if on_con else None,
-    "roads": road_fc, "water": water or None, "wcol": {k: v[2] for k, v in DRAIN.items()},
-    "cc": CON_COL, "rc": ROAD_COL, "vbc": VS_BUF_COL, "sw": SITE_W,
+    "vil": vil_fc, "roads": road_fc, "water": water or None, "wcol": {k: v[2] for k, v in DRAIN.items()},
+        "cc": CON_COL, "rc": ROAD_COL, "vbc": VS_BUF_COL, "sw": SITE_W, "vc": VIL_COL,
 }
 if vp:
     cfg["sig"] += "|vs"
@@ -2203,7 +2273,7 @@ const map = L.map('m', {preferCanvas: true, zoomSnap: 0.5}).setView(keep ? keep.
 map.on('moveend', () => { try { sessionStorage.setItem('topoView', JSON.stringify({sig: C.sig, c: map.getCenter(), z: map.getZoom()})); } catch (e) {} });
 L.control.scale().addTo(map);
 if (C.base) L.tileLayer(C.base, {maxZoom: 20, attribution: C.basemap}).addTo(map);
-[['topo', 300], ['dem_pane', 310], ['water_pane', 315], ['con_pane', 320], ['conlab_pane', 325], ['road_pane', 330], ['vsr_pane', 335], ['osm_pane', 400]]
+[['topo', 300], ['dem_pane', 310], ['water_pane', 315], ['con_pane', 320], ['conlab_pane', 325], ['road_pane', 330], ['vsr_pane', 335], ['osm_pane', 400], ['vil_pane', 450]]
   .forEach(([n, z]) => { map.createPane(n).style.zIndex = z; });
 
 if (C.dem) L.imageOverlay(C.dem.url, C.dem.b, {pane: 'dem_pane', opacity: 0.75}).addTo(map);
@@ -2225,16 +2295,28 @@ const wmIcon = L.divIcon({className: '', iconSize: [30, 34], iconAnchor: [15, 12
       + '<path d="M0 0L0 -11M0 0L-9.5 5.5M0 0L9.5 5.5M0 0L0 18" stroke="#000" stroke-width="2" stroke-linecap="round"/><circle r="2.6" fill="#000" stroke="#fff"/></svg>'});
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
+// Bhuvan villages (viewer only): whole polygons intersecting the buffer, attributes shown on hover
+if (C.vil) {
+    const vs = {color: C.vc, weight: 2, fillColor: C.vc, fillOpacity: 0.06};
+  L.geoJSON(C.vil, {pane: 'vil_pane', renderer: L.svg({pane: 'vil_pane'}), style: () => vs, onEachFeature: (f, l) => {
+    const p = f.properties || {}, nk = Object.keys(p).find(k => k.toLowerCase() === 'v_name');
+    l.bindTooltip('<div style="font:12px Arial,sans-serif"><b>' + esc(nk ? p[nk] : 'Village') + '</b><table>'
+      + Object.entries(p).filter(([k, v]) => v !== '').map(([k, v]) => '<tr><td style="padding:1px 8px 1px 0;color:#555">' + esc(k)
+      + '</td><td>' + esc(v) + '</td></tr>').join('') + '</table></div>', {sticky: true});
+    l.on({mouseover: e => e.target.setStyle({weight: 2.5, fillOpacity: 0.25}), mouseout: e => e.target.setStyle(vs)});
+  }}).addTo(map);
+}
+
 // siteG = vectors + their buffers (2/5/10 km ...) shown on every tab except Vantage; vsG = WTG site + WTG buffer + vantage results (Vantage tab only)
 const siteG = L.layerGroup().addTo(map), vsG = L.layerGroup();
 let all = null;
 C.layers.forEach(lay => {
   const n = lay.bufs.length, dash = lay.dash ? '8,6' : null, cols = lay.cols || C.colors;
   const grow = g => { all = all ? all.extend(g.getBounds()) : g.getBounds(); };
-  lay.bufs.forEach((b, i) => grow(L.geoJSON(b.gj, {style: {color: cols[i == 0 ? 0 : i == n - 1 ? 2 : 1], weight: 2.5, dashArray: dash, fill: false},
+    lay.bufs.forEach((b, i) => grow(L.geoJSON(b.gj, {style: {color: cols[Math.min(i, cols.length - 1)], weight: 2.5, dashArray: dash, fill: false},
     pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon})}).bindTooltip(b.label, {sticky: true}).addTo(siteG)));
     grow(L.geoJSON(lay.fc, {
-    style: {color: C.colors[0], weight: Math.max(C.sw * 2.4, 0.8), dashArray: dash, fill: true, fillOpacity: 0},
+        style: {color: lay.scol || C.colors[0], weight: Math.max(C.sw * 2.4, 0.8), dashArray: dash, fill: true, fillOpacity: 0},
     pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon}),
     onEachFeature: (f, layer) => {
       const p = f.properties || {};
@@ -2316,11 +2398,11 @@ class CSrc {
     return {data: b};
   }
 }
+// z0-12 part: normal. z13-14 detail strips: shown from z13, overzoomed beyond z14, drawn above the all-India part
 const addPM = async (url, v) => {
   const src = new pmtiles.PMTiles(new CSrc(url, v)), h = await src.getHeader();
-  const detail = h.minZoom >= 13;   // SOI detail strips: show from z13 and overzoom past z14
   pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxNativeZoom: h.maxZoom,
-    maxZoom: detail ? 20 : h.maxZoom, zIndex: h.minZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
+    maxZoom: h.minZoom >= 13 ? 20 : h.maxZoom, zIndex: h.minZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
 };
 (async () => {
   for (const g of (C.geo_img || [])) {
@@ -2337,7 +2419,7 @@ const addPM = async (url, v) => {
   }
 })();
 
-// one-time warm-up per browser and data version: zoomed-out tiles of every sheet
+// one-time warm-up per browser and data version: zoomed-out tiles of every low-zoom sheet (never the z13+ detail strips)
 setTimeout(async () => {
   try { if (!C.all.length || localStorage.getItem('pmWarm') === C.wv) return; } catch (e) { return; }
   const q = C.all.slice();
@@ -2399,6 +2481,8 @@ with col_leg:
                 lg += f'<div class="lg"><i style="background:{tint(c)};border:{w}px solid {c}"></i><b>{lab}</b></div>'
             else:
                 lg += f'<div class="lg"><i style="height:0;border-top:{w}px solid {c}"></i><b>{lab}</b></div>'
+        if vil_fc:
+            lg += f'<div class="lg"><i style="background:{tint(VIL_COL)};border:1px solid {VIL_COL}"></i><b>Bhuvan Village Boundary</b></div>'
         # vantage group: shown only while the Vantage tab is open (or when the open tab cannot be detected)
         lv = ""
         if vs_b:
@@ -2457,7 +2541,6 @@ def geo_ui():
             st.error(f"{r['name']}: {r['error']}")
     pu = j.get("push") or {}
     if pu.get("status") == "done":
-        st.session_state["geo_select"] = list(set(st.session_state.get("geo_select", [])) | {r["name"] + ".pmtiles" for r in ok})
         release_assets.clear()
         end()
         st.rerun()
@@ -2531,7 +2614,7 @@ def export_ui():
         hd, hc, hr, hw, hs = KINDS[kind]
         topo = not any(KINDS[kind])
         if topo and not (chosen or geo_ov):
-            st.warning("Select at least one toposheet in the Toposheet viewer tab first.")
+            st.warning("No toposheets found in the library.")
         elif hs and not layers:
             st.warning("Upload at least one vector first (the satellite map shows the vectors).")
         else:
@@ -2572,7 +2655,8 @@ for l in layers:
     k0 = l["key"]
     dls.append((f"⬇️ {l['name']} (KML)",
                 memo(("site", k0), lambda l=l: to_kml(
-                    l["name"], [(feat_name(f["props"], l["name"]), shape(f["geom"]), f["props"]) for f in l["feats"]], COLORS[0])),
+                    l["name"], [(feat_name(f["props"], l["name"]), shape(f["geom"]), f["props"]) for f in l["feats"]],
+                    l.get("scol", COLORS[0]))),
                 slug(l["name"]) + ".kml", KML))
     for i, b in enumerate(l["bufs"]):
         dls.append((f"⬇️ {b['label']} (KML)",

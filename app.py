@@ -616,6 +616,8 @@ def mosaic(src, bounds, max_tiles, on_tile=None):
     while z > zmin and (x1 - x0 + 1 > max_tiles or y1 - y0 + 1 > max_tiles):
         z -= 1
         n, x0, x1, y0, y1 = tile_range(bounds, z)
+    if z == zmin and zmin > 8 and (x1 - x0 + 1 > max_tiles or y1 - y0 + 1 > max_tiles):
+        return None
     canvas = Image.new("RGBA", ((x1 - x0 + 1) * 256, (y1 - y0 + 1) * 256), (0, 0, 0, 0))
     tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
@@ -2312,7 +2314,9 @@ class CSrc {
 }
 const addPM = async (url, v) => {
   const src = new pmtiles.PMTiles(new CSrc(url, v)), h = await src.getHeader();
-  pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxZoom: h.maxZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
+  const detail = h.minZoom >= 13;   // SOI detail strips: show from z13 and overzoom past z14
+  pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxNativeZoom: h.maxZoom,
+    maxZoom: detail ? 20 : h.maxZoom, zIndex: h.minZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
 };
 (async () => {
   for (const g of (C.geo_img || [])) {
@@ -2337,6 +2341,7 @@ setTimeout(async () => {
     for (let p; (p = q.shift());) {
       try {
         const s = new pmtiles.PMTiles(new CSrc(p.r2, p.v)), h = await s.getHeader();
+        if (h.minZoom > 8) continue;
         for (let z = h.minZoom; z <= Math.min(h.minZoom + 2, h.maxZoom); z++) {
           const n = 2 ** z, cl = v => Math.min(n - 1, Math.max(0, Math.floor(v)));
           const tx = lo => cl((lo + 180) / 360 * n), ty = la => cl((1 - Math.asinh(Math.tan(la * Math.PI / 180)) / Math.PI) / 2 * n);

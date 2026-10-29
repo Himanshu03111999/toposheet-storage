@@ -1658,7 +1658,7 @@ def match_sheet(filename, table):
     return next(((c.upper(), table[c.upper()]) for c in re.findall(r"[A-Za-z0-9]+", os.path.splitext(filename)[0])
                  if c.upper() in table), None)
 
-
+fmt_sheet = lambda k: re.sub(r"^(\d{1,3}[A-P])0*(\d+)$", r"\1/\2", k)   # 56G05 -> 56G/5; unchanged if the name has another pattern
 def sheet_no(name):
     s = re.findall(r"\d{1,3}[A-P]/?\d{1,2}", name, re.I)
     if not s:
@@ -2079,9 +2079,15 @@ def touches_buffer(name):
     return True if b is None else any(g.intersects(box(*b)) for g in outer)
 
 
-names = [n for n in chosen if not outer or touches_buffer(n)]
-sheets = [s for s in dict.fromkeys(sheet_no(n) for n in names) if s]
-sheets_str = ", ".join(sheets) or ("None within buffers" if chosen else "56F/12, 56F/8, 56G/5, 56G/9")
+sheets_str = ""
+if outer:   # sheet numbers only when a vector is loaded: OSM index sheets that touch the outermost buffer
+    try:
+        _tbl = osm_sheet_table(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
+        _u = unary_union(outer)
+        sheets_str = ", ".join(fmt_sheet(k) for k, b in sorted(_tbl.items()) if _u.intersects(box(*b)))
+    except Exception as e:
+        notes.error(f"Sheet index: {e}")
+sheets_str = sheets_str or "-"
 
 ou_wkb = unary_union(outer).wkb if outer else None
 okey = f"{zlib.crc32(ou_wkb)}:{len(ou_wkb)}" if ou_wkb else ""
@@ -2143,9 +2149,7 @@ def preview_url(job, name):
 
 
 geo_local = [os.path.join(gjob["dir"], r["name"] + ".pmtiles") for r in geo_ov]
-_gs = [x for x in (sheet_no(r["name"]) for r in geo_ov) if x]
-if _gs:
-    sheets_str = ", ".join(dict.fromkeys(sheets + _gs))
+
 if geo_ov:
     publish_static(st.session_state["geo_id"], gjob)
 

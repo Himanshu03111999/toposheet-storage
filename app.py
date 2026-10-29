@@ -2009,7 +2009,7 @@ with T[1]:
 
 with T[2]:
     show_topo = st.toggle("🗾 Show topo layer on the map", value=False)
-    st.caption("The whole Indis SOI OSM 50k")
+    st.caption("The whole India SOI OSM 50k")
 
 with T[3]:
     show_dr = {k: col.toggle(f"💧 {v[0]}", value=False) for col, (k, v) in zip(st.columns(4), DRAIN.items())}

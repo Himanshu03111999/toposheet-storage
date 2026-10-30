@@ -482,7 +482,8 @@ def build_terrain(ou_wkb):
     if not v.size:
         raise RuntimeError("no DEM data inside the buffer")
     lo, hi = math.floor(v.min()), math.ceil(v.max())
-    edges = np.linspace(lo, max(hi, lo + 1), 6).tolist()
+    q = np.unique(np.round(np.percentile(v, [0, 20, 40, 60, 80, 100])))   # quantile breaks: ~20% of pixels per class
+    edges = q.tolist() if len(q) == 6 else np.linspace(lo, max(hi, lo + 1), 6).tolist()   # flat terrain: fall back to equal interval
     f = np.where(np.isnan(e), np.nanmin(e), e)  # light smoothing -> cleaner contours
     pd = np.pad(f, 1, mode="edge")
     f = sum(pd[i:i + f.shape[0], j:j + f.shape[1]] for i in range(3) for j in range(3)) / 9

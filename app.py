@@ -1062,16 +1062,16 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
                     else:
                         vec.append((pts_, c, pt(lw), dash))
     if has_sat:
-        for pts, c, lw, dash in vec:
+        for pts, c, lw, dash in vec:      # white halo only on satellite maps
             draw_path(md, pts, "white", lw + pt(1))
-    for pts, c, lw, dash in vec:
+    for pts, c, lw, dash in vec:          # lines and buffers on every map type
         draw_path(md, pts, c, lw, dash)
-        for (x_, y_), dc in wm:
-            if dc:
-               r_ = pt(5)
-        md.ellipse([x_ - r_, y_ - r_, x_ + r_, y_ + r_], fill=dc, outline="white", width=max(1, pt(1.5)))
-    else:
-        draw_windmill(md, x_, y_, pt(12))
+    for (x_, y_), dc in wm:
+        if dc:   # Vector 2 point -> plain dot in its colour
+            r_ = pt(5)
+            md.ellipse([x_ - r_, y_ - r_, x_ + r_, y_ + r_], fill=dc, outline="white", width=max(1, pt(1.5)))
+        else:    # Vector 1 point -> windmill
+            draw_windmill(md, x_, y_, pt(12))
     if has_con:
         draw_contour_labels(map_img, ex.get("contours"), tp, pt, LABEL_STEP)
 

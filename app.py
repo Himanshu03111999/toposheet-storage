@@ -260,7 +260,8 @@ site_fc = lambda l: {"type": "FeatureCollection",
 
 
 def legend_rows(layers):
-                return [r for l in layers for r in [(l["name"], l.get("scol", COLORS[0]), SITE_W, l["dash"], l.get("pts", False))] +
+                    return [r for l in layers for r in [(l["name"], l.get("scol", COLORS[0]), SITE_W, l["dash"],
+                                         ("dot" if l.get("v2") else True) if l.get("pts", False) else False)] +
             [(b["label"], buf_color(i, len(l["bufs"]), l.get("cols", COLORS)), 2, l["dash"], False) for i, b in enumerate(l["bufs"])]]
 
 
@@ -1057,7 +1058,7 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
                 for path in geom_paths(g):
                     pts_ = [tp(x, y) for x, y in path]
                     if len(pts_) == 1:
-                        wm.append(pts_[0])
+                        wm.append((pts_[0], c if l.get("v2") else None))   # colour => plain dot, None => windmill
                     else:
                         vec.append((pts_, c, pt(lw), dash))
     if has_sat:
@@ -1065,7 +1066,11 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
             draw_path(md, pts, "white", lw + pt(1))
     for pts, c, lw, dash in vec:
         draw_path(md, pts, c, lw, dash)
-    for x_, y_ in wm:
+        for (x_, y_), dc in wm:
+            if dc:
+               r_ = pt(5)
+        md.ellipse([x_ - r_, y_ - r_, x_ + r_, y_ + r_], fill=dc, outline="white", width=max(1, pt(1.5)))
+    else:
         draw_windmill(md, x_, y_, pt(12))
     if has_con:
         draw_contour_labels(map_img, ex.get("contours"), tp, pt, LABEL_STEP)
@@ -1116,7 +1121,10 @@ def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress
         y = min(.672, (.69 + sep) / 2 + (.03 * (nrow - 1) + .02) / 2 - .02)
     for lab, c, lw, dashed, icon in rows:
         x0_, x1_, y0_, y1_ = PX(.06), PX(.19), PY(y + .02), PY(y)
-        if icon:
+        if icon == "dot":
+            r_, mx_, my_ = pt(5), (x0_ + x1_) / 2, (y0_ + y1_) / 2
+            d.ellipse([mx_ - r_, my_ - r_, mx_ + r_, my_ + r_], fill=c, outline="white", width=max(1, pt(1.5)))
+        elif icon:
             draw_windmill(d, (x0_ + x1_) / 2, (y0_ + y1_) / 2 - ph * .006, ph * .011)
         else:
                         draw_path(d, [(x0_, y0_), (x1_, y0_), (x1_, y1_), (x0_, y1_), (x0_, y0_)], c, pt(lw), (pt(6), pt(4)) if dashed else None)
@@ -2316,8 +2324,12 @@ C.layers.forEach(lay => {
     lay.bufs.forEach((b, i) => grow(L.geoJSON(b.gj, {style: {color: cols[Math.min(i, cols.length - 1)], weight: 2.5, dashArray: dash, fill: false},
     pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon})}).bindTooltip(b.label, {sticky: true}).addTo(siteG)));
     grow(L.geoJSON(lay.fc, {
-        style: {color: lay.scol || C.colors[0], weight: Math.max(C.sw * 2.4, 0.8), dashArray: dash, fill: true, fillOpacity: 0},
-    pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon}),
+        style: f => (lay.v2 && f.geometry.type.indexOf('Point') >= 0)
+      ? {color: '#fff', weight: 2, fillColor: lay.scol || C.colors[0], fillOpacity: 1}
+      : {color: lay.scol || C.colors[0], weight: Math.max(C.sw * 2.4, 0.8), dashArray: dash, fill: true, fillOpacity: 0},
+    pointToLayer: (f, ll) => lay.v2
+      ? L.circleMarker(ll, {radius: 8})
+      : L.marker(ll, {icon: wmIcon}),
     onEachFeature: (f, layer) => {
       const p = f.properties || {};
       const nk = Object.keys(p).find(k => k.toLowerCase() === 'name' && p[k] !== null && p[k] !== '');
@@ -2469,7 +2481,9 @@ with col_leg:
         st.markdown("### **Legends**")
         # main group: original vectors + their buffers (colours identical to the map) and the other layers
         lg = "".join(
-            (f'<div class="lg">{WM_SVG}<b>{lab}</b></div>' if icon else
+            (f'<div class="lg"><i style="width:12px;height:12px;margin:0 5px;border-radius:50%;background:{c};'
+             f'border:2px solid #fff;box-shadow:0 0 0 1px #777"></i><b>{lab}</b></div>' if icon == "dot" else
+             f'<div class="lg">{WM_SVG}<b>{lab}</b></div>' if icon else
              f'<div class="lg"><i style="border:{w}px {"dashed" if dash else "solid"} {c}"></i><b>{lab}</b></div>')
             for lab, c, w, dash, icon in legend_rows(layers))
         if on_dem:

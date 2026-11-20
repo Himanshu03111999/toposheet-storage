@@ -66,7 +66,7 @@ SAT_BASE = BASEMAPS["Google Satellite"]
 TERRAIN_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
 FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
-SITE_W = .8   # project-site line thickness (points) - used by export legend, export map and live map
+SITE_W = 1   # project-site line thickness (points) - used by export legend, export map and live map
 V2_EXP_W = 2.0   # export only: Vector 2 line thickness (points). 2.0 = same as Vector 1 buffer lines
 TITLE_HEAD_FS, TITLE_FS = 16, 22  # "Title :" label / project name (starting size, auto-shrinks to fit)
 LEG_HEAD_FS, LEG_FS = 18, 14       # "Legends" heading / legend row text

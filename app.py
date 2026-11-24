@@ -1,1510 +1,2717 @@
-"""DREAM dMRV Engine v6.1 - farmer-reported vs Sentinel-1 verified AWD (GEE + CHIRPS + ESA acquisition plan)
-Run:  streamlit run dmrv_awd.py        (needs Streamlit >= 1.39)
-  * Landing page only before sign-in (side panel closed until you click the CTA); smaller fonts
-  * After sign-in: one horizontal bar  [6 tabs] ... [◀ ▶] [💾 Save analysis]
-  * "Plots to audit" sits beside "Inspect plot" again
-  * Run analysis runs in a background thread; progress is the vertical bar on the right (top to bottom)
-  * Saved analyses live in Hugging Face folder  dmrv_analysis/<id>/  (needs HF_TOKEN with write access)
 """
-import os, io, re, json, base64, tempfile, time, hashlib, hmac, shutil, math, uuid, gzip, pickle, threading, datetime as dt
-import numpy as np, pandas as pd, geopandas as gpd
-import streamlit as st, folium, ee
-import streamlit.components.v1 as components
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from shapely.geometry import mapping
-from folium.plugins import Fullscreen, MousePosition
-from streamlit_folium import st_folium
+Geospatial Site Analysis & Mapping Dashboard - single file.   Run: streamlit run app.py   (login: APP_USER / APP_PASS env or secrets)
+Needs: streamlit requests geopandas shapely>=2 pyproj pillow>=10.1 pmtiles numpy contourpy mapbox-vector-tile huggingface_hub hf_xet
+       opencv-python-headless pymupdf tifffile (the last few auto-install when needed).
+Data: HF dataset himanshuguptta/geotiff-hub (HF_TOKEN), byte-range reads. R2_BASE (env/secret): toposheets from R2 first.
+Topo: whole SOI-OSM-50k parts (part0000 = z0-12 all India, part0001-5 = z13-14 longitude strips) are loaded automatically.
+Villages: bhuvan_villages.pmtiles (viewer only).
+Workers: "--export <dir>" (PNG) and "--georef <dir>" (PDF/GeoTIFF -> PMTiles).
+Optional: .streamlit/config.toml -> [server] enableStaticServing = true gives a live tile preview of fresh sheets (else a JPEG preview is used).
+"""
+import os as _os
+LOGIN_USER, LOGIN_PASS = _os.getenv("APP_USER", "Kosher"), _os.getenv("APP_PASS", "Himanshugis")
 
-st.set_page_config(page_title="AWD dMRV Platform", page_icon="🌾", layout="wide", initial_sidebar_state="collapsed")
+import os, re, io, sys, gc, json, math, time, uuid, zlib, base64, shutil, zipfile, tempfile, textwrap, \
+    subprocess, types, hmac, importlib, faulthandler, threading
+from collections import defaultdict
+from functools import lru_cache
+from urllib.parse import quote
+from xml.sax.saxutils import escape
+from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from pyproj import datadir
+    os.environ["PROJ_LIB"] = os.environ["PROJ_DATA"] = datadir.get_data_dir()
+except Exception:
+    pass
+
+import numpy as np
+import requests
+from requests.adapters import HTTPAdapter
+import geopandas as gpd
+import shapely
+from shapely import wkb as swkb, make_valid
+from shapely.geometry import box, shape, mapping, LineString, Point, GeometryCollection
+from shapely.ops import unary_union
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, TiffImagePlugin
+from pmtiles.reader import Reader
+
+Image.MAX_IMAGE_PIXELS = None
+
+APP_TITLE = "Geospatial Site Analysis & Mapping Dashboard"
 HF_REPO = "himanshuguptta/geotiff-hub"
-HF_FOLDER = "dmrv_analysis"
-DISPLAY_TZ = "Asia/Kolkata"
-GEE_PROJECT = os.getenv("EE_PROJECT", "virtual-strata-442411-p6")
-SERVICE_ACCOUNT = os.getenv("EE_SERVICE_ACCOUNT", "himanshu-guptta1@virtual-strata-442411-p6.iam.gserviceaccount.com")
-KEY_PATH = os.getenv("EE_PRIVATE_KEY_PATH", "C:/Users/Syste/Downloads/virtual-strata-442411-p6-d7fa3aa0b1cf.json")
-AUTH_USER = os.getenv("DMRV_USER", "kosher"); AUTH_PASS = os.getenv("DMRV_PASS", "Himanshugis")   # move to env / st.secrets
-AHEAD = 20                                                                                       # default satellite-path look-ahead (days)
-NAV = [("🗺 Spatial Audit", "Spatial Audit"), ("🌿 Graph CH4 & Stackable Export", "Export"), ("🛰 Multispectral Analysis", "Multispectral Analysis"),
-       ("🧪 Ground Truth Verification", "Ground truth"), ("📍 Satellite Path", "Satellite Path"), ("🌾 Paddy Identification 🔒", "Paddy")]
+HF_BASE = f"https://huggingface.co/datasets/{HF_REPO}"
+HF_TREE = f"https://huggingface.co/api/datasets/{HF_REPO}/tree/main?recursive=true"
+R2_BASE = (os.getenv("R2_BASE") or "").rstrip("/")
+TILE_WORKERS, JOB_TTL, LIST_TTL, WATCH_EVERY = 32, 1800, 20, 30
+GEO_MIN_ZOOM, GEO_QUALITY, GEO_TTL, GEO_DPI = 6, 90, 3 * 3600, 200
+R = 6378137.0
+COLORS = ["#000000", "#d00000", "#0057ff", "#00a651", "#ff7a00"]   # buffer 1..5
+V2_COLS = ["#000000", "#d00000", "#0057ff", "#00a651", "#8e44ad", "#ff7a00"]   # default colours for Vector 2 files (first = black)
+DPI_OPTIONS = [300, 500, 800]
+LOGO_SCALE, LOGO_H_PT, PREVIEW_PX = 0.6, 100, 3200
+STATIC_GEO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "geo")
+try:
+    os.makedirs(STATIC_GEO, exist_ok=True)
+except OSError:
+    pass
 
-# logout link (full reload = new session = signed out)
-if "logout" in st.query_params:
-    st.session_state.clear(); st.query_params.clear()
-# keep the "plots to audit" widget value alive even on runs where the widget is not drawn (e.g. Saved view)
-if "n_rows_w" in st.session_state: st.session_state["n_rows_w"] = st.session_state["n_rows_w"]
+BASEMAPS = {"White": None,
+            "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+            "Google Satellite": "https://mt1.google.com/vt/lyrs=s&x={x}&y={y}&z={z}",
+            "Google Hybrid": "https://mt1.google.com/vt/lyrs=y&x={x}&y={y}&z={z}",
+            "Google Roadmap": "https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}",
+            "Esri Satellite": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"}
+SAT_BASE = BASEMAPS["Google Satellite"]
+TERRAIN_URL = "https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png"
+FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts")
 
-# ============================================================ SENTINEL-1 ACQUISITION PLAN (ESA KML)
-S1_PAGE = "https://sentinels.copernicus.eu/copernicus/sentinel-1/acquisition-plans"
-_KML_RX = re.compile(r'href=["\']([^"\']*?/documents/d/sentinel/(s1[abcd])_mp_user_(\d{8}t\d{6})_(\d{8}t\d{6})[^"\']*)', re.I)
-def _fname_t(s): return pd.Timestamp(dt.datetime.strptime(s.upper(), "%Y%m%dT%H%M%S"))
+SITE_W = 1  # project-site line thickness (points) - used by export legend, export map and live map
+V2_EXP_W = 2.0   # export only: Vector 2 line thickness (points). 2.0 = same as Vector 1 buffer lines
+TITLE_HEAD_FS, TITLE_FS = 16, 22  # "Title :" label / project name (starting size, auto-shrinks to fit)
+LEG_HEAD_FS, LEG_FS = 18, 14       # "Legends" heading / legend row text
 
-def list_plan_links(html):
-    out = {}
-    for href, sat, a, b in _KML_RX.findall(html):
-        path = "/documents/d/sentinel/" + href.split("/documents/d/sentinel/")[1].split("?")[0]
-        out[path] = ("https://sentinels.copernicus.eu" + path, sat.upper(), _fname_t(a), _fname_t(b))
-    return list(out.values())
 
-@st.cache_data(show_spinner=False, ttl=3 * 3600)
-def fetch_plan_kmls(ahead=25):
-    import requests
-    from concurrent.futures import ThreadPoolExecutor
-    H = {"User-Agent": "Mozilla/5.0"}
-    now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-    allk = list_plan_links(requests.get(S1_PAGE, headers=H, timeout=30).text)
-    if not allk: raise RuntimeError("ESA page loaded but no plan links were found (layout may have changed).")
-    links = [l for l in allk if l[3] >= now and l[2] <= now + pd.Timedelta(days=ahead)]
-    if not links: raise RuntimeError(f"ESA lists {len(allk)} plans but none cover the next {ahead} days yet.")
-    def get(l):
-        for u in (l[0], l[0] + "?download=true"):
-            try:
-                r = requests.get(u, headers=H, timeout=90)
-                if r.ok and b"<kml" in r.content[:2000].lower():
-                    return (f"{l[1]}_{l[2]:%Y%m%dT%H%M%S}_{l[3]:%Y%m%dT%H%M%S}.kml", r.content)
-            except Exception: pass
-    with ThreadPoolExecutor(max_workers=6) as ex: got = tuple(x for x in ex.map(get, links) if x)
-    if not got: raise RuntimeError(f"Found {len(links)} plan link(s) but none downloaded.")
-    return got
+DEM_PAL = ["#ffffd4", "#fed98e", "#fe9929", "#d95f0e", "#993404"]
+DEM_SRC = "NASA SRTM 30 meter Digital Elevation"
+ROAD_SRC, ROAD_COL = "Survey of India", "#8b4513"
+WATER_SRC = ("Bhuvan LULC-10k:SIS-DP Phase 2 (2018-23) datasets rectified with current "
+             "Google Earth Imagery (2025-26)")
+SAT_SRC = "Google Earth Imagery"
+VIL_COL = "#fff200"
+DRAIN = {"canal": ("Canal / Drain", "canal_drain", "#00897b"),
+         "lake": ("Lake / Pond", "lake_pond", "#29b6f6"),
+         "river": ("River / Stream", "river_stream", "#1f4fd8"),
+         "reservoir": ("Reservoir / Tank", "reservoir_tank", "#8e44ad")}
+tint = lambda c, a=.45: "#" + "".join(f"{int(255 - (255 - int(c[i:i + 2], 16)) * a):02x}" for i in (1, 3, 5))
+norm = lambda s: re.sub(r"[\s_\-]+", "", s.lower())
+stem_of = lambda k: norm(os.path.splitext(k)[0])
+is_vec = lambda k: stem_of(k).startswith(("roads", "bhuvanvillages")) or stem_of(k) in {norm(v[1]) for v in DRAIN.values()}
+WM_SVG = ('<svg width="22" height="14" viewBox="-17 -11 34 22" style="flex:none"><path d="M0 -2L0 -11M0 -2L-7.8 2.5M0 -2L7.8 2.5M0 -2L0 10" '
+          'stroke="#000" stroke-width="1.8" stroke-linecap="round" fill="none"/><circle cx="0" cy="-2" r="2" fill="#000"/></svg>')
+CON_COL = "#707070"
+CONTOUR_STEP, LABEL_STEP, CONTOUR_MIN_LEN = 10, 20, 500
+KML = "application/vnd.google-earth.kml+xml"
+VS_CC, VS_BATCHES, VS_EXCL_M, VS_ELEV_W = 0.87, 3, 50, 0.25
+VS_COL = ["#b00020", "#0b4f8a", "#4a148c"]   # dark, saturated colours (stay visible on satellite imagery)
+VS_RAS = "#00fbff"                           # visibility raster: dark sky blue
+VS_BUF_COL = "#000000"                       # WTG-buffer outline: black
+VS_RAS_MAXPX = 1600                          # visibility raster PNG is capped to this many pixels on its longest side
+KINDS = {"Toposheet Map": (0, 0, 0, 0, 0), "DEM - Elevation Map": (1, 0, 0, 0, 0), "DEM - Contour Map": (1, 1, 0, 0, 0),
+         "Roads & Transportation Map": (0, 0, 1, 0, 0), "Drainage Map": (0, 0, 0, 1, 0), "Satellite Map": (0, 0, 0, 0, 1)}
 
-@st.cache_data(show_spinner=False)
-def read_footprints(kmls, bbox):
-    """IW + VV/VH datatake footprints. Where files overlap, the file with the latest start wins."""
-    import xml.etree.ElementTree as ET
-    from shapely.geometry import Polygon, box
-    bb, rows, covered = box(*bbox), [], []
-    def span(n):
-        m = re.search(r"(\d{8}T\d{6})_(\d{8}T\d{6})", n.upper())
-        return (_fname_t(m.group(1)), _fname_t(m.group(2))) if m else (pd.Timestamp.min, pd.Timestamp.max)
-    for name, raw in sorted(kmls, key=lambda k: span(k[0])[0], reverse=True):
-        new = []
-        for pm in ET.parse(io.BytesIO(raw)).getroot().iter():
-            if not pm.tag.endswith("Placemark"): continue
-            d = {x.get("name"): (x.findtext("{*}value") or "").strip() for x in pm.iter() if x.tag.endswith("Data")}
-            co = next((k.text for k in pm.iter() if k.tag.endswith("coordinates") and k.text), None)
-            if not co or not d.get("ObservationTimeStart") or not (d.get("Mode") == "IW" and d.get("Polarisation") == "DV"): continue
-            pts = [tuple(map(float, q.split(",")[:2])) for q in co.split() if "," in q]
-            if len(pts) < 4: continue
-            poly, t = Polygon(pts), pd.Timestamp(d["ObservationTimeStart"])
-            if poly.is_valid and poly.intersects(bb) and not any(a <= t <= b for a, b in covered):
-                new.append(dict(sat=d.get("SatelliteId", "S1"), time=t, geometry=poly))
-        rows += new; covered.append(span(name))
-    return gpd.GeoDataFrame(rows, geometry="geometry", crs=4326) if rows else gpd.GeoDataFrame(columns=["sat", "time", "geometry"], geometry="geometry", crs=4326)
+TOKEN = os.getenv("HF_TOKEN")
+session = requests.Session()
+if TOKEN:
+    session.headers.update({"Authorization": f"Bearer {TOKEN}"})
+web = requests.Session()  # other hosts: never sends the HF token
+web.headers["User-Agent"] = "Mozilla/5.0 (toposheet-app)"
+for _s in (session, web):
+    _s.mount("https://", HTTPAdapter(pool_connections=16, pool_maxsize=64))
 
-_TZF = []
-def tz_for(lon, lat):
-    """Best IANA time zone for a location (timezonefinder if installed, else India box, else nearest whole-hour zone)."""
+_S = sys.modules.get("_topo_state")  # shared state survives Streamlit reruns
+if _S is None:
+    _S = sys.modules["_topo_state"] = types.SimpleNamespace()
+for _k in ("sig", "bounds", "r2"):
+    if not hasattr(_S, _k):
+        setattr(_S, _k, {})
+
+
+def ensure(mod, pkg):
     try:
-        from timezonefinder import TimezoneFinder
-        if not _TZF: _TZF.append(TimezoneFinder())
-        z = _TZF[0].timezone_at(lng=float(lon), lat=float(lat))
-        if z: return z
-    except Exception: pass
-    if 68 <= lon <= 98 and 6 <= lat <= 37: return "Asia/Kolkata"
-    h = int(round(lon / 15)); return f"Etc/GMT{-h:+d}" if h else "UTC"
+        return importlib.import_module(mod)
+    except ImportError:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", *pkg.split()], capture_output=True, text=True)
+        if r.returncode:
+            raise RuntimeError(f"Could not install {pkg} - run: pip install -U {pkg}\n" + r.stderr[-300:])
+        importlib.invalidate_caches()
+        return importlib.import_module(mod)
 
-def to_local(t, tz):
-    try: return pd.Timestamp(t).tz_localize("UTC").tz_convert(tz).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception: return ""
 
-def sat_plan(gdf, ahead=AHEAD):
-    """All planned IW VV/VH passes over every plot in the next `ahead` days, with local time per plot."""
-    try:
-        kmls = fetch_plan_kmls(ahead + 5)
-        fp = read_footprints(kmls, tuple(gdf.total_bounds + np.array([-1, -1, 1, 1])))
-        now = pd.Timestamp.now(tz="UTC").tz_localize(None)
-        L = fp[(fp.time >= now) & (fp.time <= now + pd.Timedelta(days=ahead))].drop_duplicates(["sat", "time"]).reset_index(drop=True)
-        P = gpd.GeoDataFrame({"pid": gdf.pid.to_numpy()}, geometry=gdf.geometry.to_numpy(), crs=4326)
-        ps = (pd.DataFrame(gpd.sjoin(P, L[["sat", "time", "geometry"]], predicate="intersects")[["pid", "sat", "time"]])
-              if not L.empty else pd.DataFrame(columns=["pid", "sat", "time"])).sort_values(["pid", "time"])
-        grp = {k: v for k, v in ps.groupby("pid")}
-        rows, tips = [], {}
-        for p in gdf.itertuples():
-            tz, sub = tz_for(p.lon_c, p.lat_c), grp.get(p.pid)
-            if sub is None or sub.empty:
-                rows.append(dict(Plot=p.pid, Satellite="", Pass_UTC=f"No pass in next {ahead} days", Pass_local="", Time_zone=tz, Days_ahead=None)); tips[p.pid] = "No pass"
+def list_assets():
+    out, sig, url = {}, {}, HF_TREE
+    while url:
+        r = session.get(url, timeout=30)
+        r.raise_for_status()
+        for f in r.json():
+            if f.get("type") == "file":
+                out[os.path.basename(f["path"])] = f["path"]
+                sig[f["path"]] = f"{(f.get('lfs') or {}).get('oid') or f.get('oid')}:{f.get('size')}"
+        url = r.links.get("next", {}).get("url")
+    _S.sig = sig
+    return out
+
+
+def fetch_range(path, rng=None):
+    h = {"Accept-Encoding": "identity", **({"Range": rng} if rng else {})}
+    if R2_BASE and path.lower().endswith(".pmtiles") and _S.r2.get(path, True):
+        try:
+            r = web.get(f"{R2_BASE}/{quote(os.path.basename(path))}", headers=h, timeout=30)
+            if r.status_code in (200, 206):
+                return r.status_code, r.headers.get("Content-Range"), r.content
+            if r.status_code in (403, 404):
+                _S.r2[path] = False
+        except Exception:
+            pass
+    for a in range(3):
+        try:
+            r = session.get(f"{HF_BASE}/resolve/main/{quote(path)}", headers=h, timeout=30)
+            if r.status_code == 429:
+                time.sleep(min(float(r.headers.get("Retry-After", 2)), 10))
                 continue
-            lst = []
-            for s in sub.itertuples():
-                loc = to_local(s.time, tz)
-                rows.append(dict(Plot=p.pid, Satellite=s.sat, Pass_UTC=f"{s.time:%Y-%m-%d %H:%M:%S}", Pass_local=loc, Time_zone=tz,
-                                 Days_ahead=round((s.time - now).total_seconds() / 86400, 1)))
-                lst.append(f"{s.sat} {loc}")
-            tips[p.pid] = "<br>".join(lst[:15]) + (f"<br>…+{len(lst) - 15} more" if len(lst) > 15 else "") + f"<br>({tz})"
-        if not L.empty:
-            c = L.geometry.centroid
-            L["utc"] = L.time.dt.strftime("%Y-%m-%d %H:%M:%S")
-            L["local"] = [to_local(t, tz_for(x, y)) for t, x, y in zip(L.time, c.x, c.y)]
-        return dict(tbl=pd.DataFrame(rows), lines=L, tips=tips, kmls=[n for n, _ in kmls], n_passes=len(ps), ahead=ahead)
-    except Exception as e:
-        return dict(err=str(e))
+            r.raise_for_status()
+            return r.status_code, r.headers.get("Content-Range"), r.content
+        except Exception:
+            if a == 2:
+                raise
+            time.sleep(.5 * (a + 1))
+    raise RuntimeError(f"Hugging Face rate limit while reading {path}")
 
-# ============================================================ STYLE
-st.markdown("""
+
+@lru_cache(maxsize=512)
+def _wb(url):
+    for a in range(3):
+        try:
+            r = web.get(url, timeout=20)
+            if r.status_code == 200:
+                return r.content
+            if r.status_code in (400, 403, 404):
+                return None
+        except Exception:
+            pass
+        time.sleep(.5 * (a + 1))
+    raise OSError(url)
+
+
+def web_img(url):
+    try:
+        b = _wb(url)
+        return Image.open(io.BytesIO(b)) if b else None
+    except Exception:
+        return None
+
+
+def reader(aid):
+    if os.path.isfile(aid):
+        def gl(o, l):
+            with open(aid, "rb") as f:
+                f.seek(o)
+                return f.read(l)
+        return Reader(gl)
+    memo_, locks, lk = {}, {}, threading.Lock()
+
+    def gb(o, l):
+        k = (o, l)
+        if k not in memo_:
+            with lk:
+                kl = locks.setdefault(k, threading.Lock())
+            with kl:
+                if k not in memo_:
+                    memo_[k] = fetch_range(aid, f"bytes={o}-{o + l - 1}")[2]
+        return memo_[k]
+    return Reader(gb)
+
+
+def sheet_bounds(aid):
+    k = (aid, _S.sig.get(aid))
+    if k not in _S.bounds:
+        try:
+            h = reader(aid).header()
+            _S.bounds[k] = tuple(h[c] / 1e7 for c in ("min_lon_e7", "min_lat_e7", "max_lon_e7", "max_lat_e7"))
+        except Exception:
+            return None
+    return _S.bounds[k]
+
+
+# ---------------- vectors + buffers ----------------
+def parse_buffers(txt):
+    v = [float(n) * (1000 if u == "km" else 1)
+         for n, u in re.findall(r"(\d+(?:\.\d+)?)\s*(km|m)(?:eters?)?(?![a-z])", txt.lower())]
+    return sorted({m for m in v if 0 < m <= 20000})
+
+
+fmt_m = lambda m: f"{m / 1000:g}km" if m >= 1000 else f"{m:g}m"
+buf_color = lambda i, n, cols=COLORS: cols[min(i, len(cols) - 1)]   # buffer k uses colour k (more than 5 buffers reuse the last colour)
+fmt_sheet = lambda k: re.sub(r"^(\d{1,3}[A-P])0*(\d+)$", r"\1/\2", k)   # 56G05 -> 56G/5; other names unchanged
+
+
+def default_labels(i, bufs):
+    if i == 1:
+        return ["Project Site"] + [("Core Zone " if k == 0 else "Buffer Zone ") + fmt_m(m) for k, m in enumerate(bufs)]
+    return ["Transmission Line"] + [f"Transmission Line Buffer {fmt_m(m)}" for m in bufs]
+
+
+def make_layer(g, labels, buf_m, dash):
+    g = g.copy()
+    g["geometry"] = g.geometry.apply(shapely.force_2d)   # KML/GeoJSON often carry Z; drop it
+    u = g.to_crs(g.estimate_utm_crs())
+    one = unary_union(list(u.geometry))
+    gj = lambda geom: json.loads(gpd.GeoSeries([geom], crs=u.crs).to_crs(4326).to_json())
+    feats = [{"props": f["properties"], "geom": f["geometry"]}
+             for f in json.loads(g.to_json(default=str))["features"] if f["geometry"]]
+    return {"name": labels[0], "dash": dash, "site": gj(one), "feats": feats,
+            "pts": any(p.geom_type == "Point" for p in getattr(one, "geoms", [one])),
+            "bufs": [{"m": m, "label": lb, "gj": gj(one.buffer(m))} for m, lb in zip(buf_m, labels[1:])]}
+
+
+light = lambda l: {k: v for k, v in l.items() if k != "feats"}
+site_fc = lambda l: {"type": "FeatureCollection",
+                     "features": [{"type": "Feature", "properties": f["props"], "geometry": f["geom"]} for f in l["feats"]]}
+
+
+def legend_rows(layers):
+                    return [r for l in layers for r in [(l["name"], l.get("scol", COLORS[0]), SITE_W, l["dash"],
+                                         ("dot" if l.get("v2") else True) if l.get("pts", False) else False)] +
+            [(b["label"], buf_color(i, len(l["bufs"]), l.get("cols", COLORS)), 2, l["dash"], False) for i, b in enumerate(l["bufs"])]]
+
+
+def line_rows(rd, con, water=None):
+    rows = [("Roads & Transportation", ROAD_COL, 2, "line")] if rd else []
+    for k, fc in (water or {}).items():
+        rows.append((DRAIN[k][0], DRAIN[k][2], 1.5,
+                     "fill" if any("Polygon" in f["geometry"]["type"] for f in fc["features"]) else "line"))
+    if con:
+        rows.append((f"Contour {CONTOUR_STEP} meter", CON_COL, 1, "line"))
+    return rows
+
+
+dem_labels = lambda edges: [f"{edges[i]:.0f} - {edges[i + 1]:.0f}" for i in range(5)]
+
+
+def source_text(kind):
+    hd, hc, hr, hw, hs = KINDS[kind]
+    return WATER_SRC if hw else SAT_SRC if hs else DEM_SRC if (hd or hc) else ROAD_SRC
+
+
+# ---------------- KML ----------------
+def kml_geom(g):
+    ring = lambda c: "<coordinates>" + " ".join(f"{x:.6f},{y:.6f},0" for x, y, *_ in c) + "</coordinates>"
+    t = g.geom_type
+    if g.is_empty:
+        return ""
+    if t == "Point":
+        return f"<Point><coordinates>{g.x:.6f},{g.y:.6f},0</coordinates></Point>"
+    if t == "Polygon":
+        return ("<Polygon><outerBoundaryIs><LinearRing>" + ring(g.exterior.coords) + "</LinearRing></outerBoundaryIs>" +
+                "".join("<innerBoundaryIs><LinearRing>" + ring(r.coords) + "</LinearRing></innerBoundaryIs>"
+                        for r in g.interiors) + "</Polygon>")
+    if t in ("LineString", "LinearRing"):
+        return "<LineString><tessellate>1</tessellate>" + ring(g.coords) + "</LineString>"
+    return "<MultiGeometry>" + "".join(kml_geom(s) for s in g.geoms) + "</MultiGeometry>"
+
+
+def feat_name(props, fallback):
+    return next((str(v) for k, v in props.items() if k.lower() == "name" and v not in (None, "")), fallback)
+
+
+def to_kml(name, feats, color="#000000", width=2):
+    c = "ff" + color[5:7] + color[3:5] + color[1:3]
+    sty = f"<Style><LineStyle><color>{c}</color><width>{width}</width></LineStyle><PolyStyle><fill>0</fill></PolyStyle></Style>"
+
+    def placemark(n, g, props=None):
+        props = props or {}
+        desc = next((str(v) for k, v in props.items() if k.lower() == "description" and v not in (None, "")), "")
+        ext = "".join(f'<Data name="{escape(str(k), {chr(34): "&quot;"})}"><value>{escape(str(v))}</value></Data>'
+                      for k, v in props.items() if k.lower() not in ("name", "description") and v not in (None, ""))
+        return (f"<Placemark><name>{escape(n)}</name>" + (f"<description>{escape(desc)}</description>" if desc else "") +
+                sty + (f"<ExtendedData>{ext}</ExtendedData>" if ext else "") + f"{kml_geom(g)}</Placemark>")
+
+    return ('<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2">'
+            f'<Document><name>{escape(name)}</name>{"".join(placemark(*f) for f in feats)}</Document></kml>')
+
+def villages_kml(feats, color=VIL_COL, width=2):
+    """feats = [(name, polygon geometry in lon/lat, properties)] -> KML with yellow boundary + labelled centroid point."""
+    c = "ff" + color[5:7] + color[3:5] + color[1:3]          # KML is aabbggrr
+    geoms = gpd.GeoSeries([g for _, g, _ in feats], crs=4326)
+    cents = geoms.to_crs(geoms.estimate_utm_crs()).centroid.to_crs(4326)   # true centroid (computed in metres)
+    poly_sty = (f"<Style><LineStyle><color>{c}</color><width>{width}</width></LineStyle>"
+                "<PolyStyle><fill>0</fill></PolyStyle></Style>")
+    pt_sty = (f"<Style><IconStyle><color>{c}</color><scale>.7</scale><Icon><href>"
+              "http://maps.google.com/mapfiles/kml/shapes/placemark_circle.png</href></Icon></IconStyle>"
+              f"<LabelStyle><color>{c}</color><scale>.9</scale></LabelStyle></Style>")
+
+    def ext(props):
+        e = "".join(f'<Data name="{escape(str(k), {chr(34): "&quot;"})}"><value>{escape(str(v))}</value></Data>'
+                    for k, v in props.items() if v not in (None, ""))
+        return f"<ExtendedData>{e}</ExtendedData>" if e else ""
+
+    marks = []
+    for (n, g, props), q in zip(feats, cents):
+        marks.append(f"<Placemark><name>{escape(n)}</name>{poly_sty}{ext(props)}{kml_geom(g)}</Placemark>")
+        marks.append(f"<Placemark><name>{escape(n)}</name>{pt_sty}{ext(props)}"
+                     f"<Point><coordinates>{q.x:.6f},{q.y:.6f},0</coordinates></Point></Placemark>")
+    return ('<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2">'
+            f'<Document><name>Bhuvan Villages</name>{"".join(marks)}</Document></kml>')
+# ---------------- roads / water / villages / DEM / contours ----------------
+def to_fc(g, cols=()):
+    rnd = lambda c: [round(c[0], 5), round(c[1], 5)] if isinstance(c[0], float) else [rnd(p) for p in c]
+    return {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "properties": dict(zip(cols, v)),
+         "geometry": {"type": m.geom_type, "coordinates": rnd(mapping(m)["coordinates"])}}
+        for m, *v in zip(g.geometry, *[g[c] for c in cols])]}
+
+
+def clip_geoms(g, ou, tol, kinds=("LineString",)):
+    g = g[g.geometry.notna()].copy()
+    g["geometry"] = g.geometry.apply(make_valid).intersection(ou).simplify(tol)
+    g = g[~g.geometry.is_empty].explode(index_parts=False)
+    g = g[g.geom_type.isin(kinds)]
+    return g[~g.geometry.is_empty]
+
+
+def tile_range(b, z):
+    n = 2 ** z
+    tx = lambda lon: int((lon + 180) / 360 * n)
+    ty = lambda lat: int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * n)
+    x0, x1 = sorted((tx(b[0]), tx(b[2])))
+    y0, y1 = sorted((ty(b[1]), ty(b[3])))
+    return n, max(x0, 0), min(x1, n - 1), max(y0, 0), min(y1, n - 1)
+
+
+def vt_tiles(path, bounds):
+    """Open a vector PMTiles and pick a zoom with <= 300 tiles over `bounds` -> (decode fn, n, z, tile list)."""
+    mvt = ensure("mapbox_vector_tile", "mapbox-vector-tile")
+    rd = reader(path)
+    h = rd.header()
+    z = h["max_zoom"]
+    while True:
+        n, x0, x1, y0, y1 = tile_range(bounds, z)
+        if z <= h["min_zoom"] or (x1 - x0 + 1) * (y1 - y0 + 1) <= 300:
+            break
+        z -= 1
+
+    def decode(xy):  # -> [(properties, geometry in lon/lat)]
+        x, y = xy
+        data = rd.get(z, x, y)
+        if data and data[:2] == b"\x1f\x8b":
+            data = zlib.decompress(data, 31)
+        out = []
+        for ly in (mvt.decode(data, y_coord_down=True).values() if data else []):
+            e = ly.get("extent", 4096)
+            ll = lambda c: np.column_stack(((x + c[:, 0] / e) / n * 360 - 180,
+                                            np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * (y + c[:, 1] / e) / n))))))
+            out += [(f.get("properties") or {}, shapely.transform(shape(f["geometry"]), ll)) for f in ly["features"]]
+        return out
+
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        return [pg for r in ex.map(decode, [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]) for pg in r]
+
+
+def read_vt(path, ou_wkb, kinds):
+    ou = swkb.loads(ou_wkb)
+    parts = [make_valid(g) for _, g in vt_tiles(path, ou.bounds)]
+    groups = [[g for g in parts if any(t in g.geom_type for t in tp)]
+              for k, tp in (("LineString", ("LineString",)), ("Polygon", ("Polygon",))) if k in kinds]
+    geoms = [unary_union(gr) for gr in groups if gr]
+    if not geoms:
+        return None
+    g = clip_geoms(gpd.GeoDataFrame(geometry=geoms, crs=4326), ou, 1e-5, kinds)
+    return to_fc(g) if len(g) else None
+
+
+build_roads = lambda path, ou_wkb, v=None: read_vt(path, ou_wkb, ("LineString",))
+build_water = lambda path, ou_wkb, v=None: read_vt(path, ou_wkb, ("Polygon", "LineString"))
+
+
+def build_villages(path, ou_wkb, v=None):
+    """Whole village polygons (with attributes) that intersect the outermost buffer."""
+    ou = swkb.loads(ou_wkb)
+    grp = {}
+    for p, g in vt_tiles(path, ou.buffer(.03).bounds):
+        if "Polygon" in g.geom_type:   # a village cut by tile edges is merged back by its attributes
+            grp.setdefault(json.dumps(p, sort_keys=True, default=str), (p, []))[1].append(make_valid(g))
+    items = [(p, unary_union(gs)) for p, gs in grp.values()]
+    items = [(p, g) for p, g in items if g.intersects(ou)]
+    if not items:
+        return None
+    df = gpd.GeoDataFrame([p for p, _ in items], geometry=[g for _, g in items], crs=4326)
+    cols = [c for c in df.columns if c != "geometry"]
+    if cols:
+        df[cols] = df[cols].fillna("").astype(str)
+    return to_fc(df, cols)
+
+
+def contour_label_points(g, lens_m, step=LABEL_STEP, per=3000, cap=1500):
+    out = []
+    for geom, e, L in zip(g.geometry, g["elev"], lens_m):
+        if e % step:
+            continue
+        n = max(1, int(L // per))
+        for k in range(n):
+            q = geom.interpolate((k + .5) / n, normalized=True)
+            out.append([round(q.y, 5), round(q.x, 5), int(e)])
+    return out[:cap]
+
+
+def dem_grid(b, zmax=13, span=12):
+    z = zmax
+    while z > 8:
+        _, x0, x1, y0, y1 = tile_range(b, z)
+        if max(x1 - x0, y1 - y0) < span:
+            break
+        z -= 1
+    cv, ext = mosaic((z, z, lambda zz, x, y: web_img(TERRAIN_URL.format(z=zz, x=x, y=y)), None), list(b), 99)
+    a = np.asarray(cv, dtype="float32")
+    e = a[..., 0] * 256 + a[..., 1] + a[..., 2] / 256 - 32768
+    e[a[..., 3] == 0] = np.nan
+    del a
+    if np.isnan(e).all():
+        raise RuntimeError("no elevation tiles for this area")
+    return e, (ext[0], ext[3], (ext[1] - ext[0]) / cv.width)
+
+
+def build_terrain(ou_wkb):
+    from contourpy import contour_generator
+    ou = swkb.loads(ou_wkb)
+    if ou.area == 0:
+        raise RuntimeError("add a buffer distance first (the DEM is clipped to the outermost buffer)")
+    e, (EX0, EY1, p) = dem_grid(ou.bounds, 13, 12)
+    om = gpd.GeoSeries([ou], crs=4326).to_crs(3857).iloc[0]
+    bx0, by0, bx1, by1 = om.bounds
+    c0, c1 = max(int((bx0 - EX0) // p), 0), min(int((bx1 - EX0) // p) + 1, e.shape[1])
+    r0, r1 = max(int((EY1 - by1) // p), 0), min(int((EY1 - by0) // p) + 1, e.shape[0])
+    e, X0, Y1 = e[r0:r1, c0:c1], EX0 + c0 * p, EY1 - r0 * p
+    m = Image.new("L", e.shape[::-1], 0)
+    dm = ImageDraw.Draw(m)
+    for pg in getattr(om, "geoms", [om]):
+        if pg.geom_type != "Polygon":
+            continue
+        for ring, v in [(pg.exterior, 255)] + [(r, 0) for r in pg.interiors]:
+                        dm.polygon([((c[0] - X0) / p, (Y1 - c[1]) / p) for c in ring.coords], fill=v)
+    zi = np.where(np.asarray(m) > 0, e, np.nan).astype("float32")
+    v = zi[~np.isnan(zi)]
+    if not v.size:
+        raise RuntimeError("no DEM data inside the buffer")
+    lo, hi = math.floor(v.min()), math.ceil(v.max())
+    q = np.unique(np.round(np.percentile(v, [0, 20, 40, 60, 80, 100])))   # quantile breaks: ~20% of pixels per class
+    edges = q.tolist() if len(q) == 6 else np.linspace(lo, max(hi, lo + 1), 6).tolist()   # flat terrain: fall back to equal interval
+    f = np.where(np.isnan(e), np.nanmin(e), e)  # light smoothing -> cleaner contours
+    pd = np.pad(f, 1, mode="edge")
+    f = sum(pd[i:i + f.shape[0], j:j + f.shape[1]] for i in range(3) for j in range(3)) / 9
+    xs = X0 + (np.arange(f.shape[1]) + .5) * p
+    ys = (Y1 - (np.arange(f.shape[0]) + .5) * p)[::-1]
+    cg = contour_generator(xs, ys, f[::-1])
+    rows = [(lv, LineString(l)) for lv in range(math.ceil(v.min() / CONTOUR_STEP) * CONTOUR_STEP,
+                                                  math.floor(v.max()) + 1, CONTOUR_STEP)
+            for l in cg.lines(lv) if len(l) > 1]
+    cont, clen, labs = {"type": "FeatureCollection", "features": []}, 0.0, []
+    if rows:
+        gl = gpd.GeoDataFrame({"elev": [r[0] for r in rows]}, geometry=[r[1] for r in rows], crs=3857)
+        cl_ = clip_geoms(gl, om, p / 2).to_crs(4326)
+        if len(cl_):
+            lens_m = cl_.to_crs(cl_.estimate_utm_crs()).length.values
+            keep = lens_m >= CONTOUR_MIN_LEN
+            cl_, lens_m = cl_[keep], lens_m[keep]
+            if len(cl_):
+                cont, clen, labs = to_fc(cl_, ["elev"]), float(lens_m.sum()) / 1000, contour_label_points(cl_, lens_m)
+    return zi, (X0, Y1, p), edges, cont, clen, labs
+
+
+def dem_rgba(z, g, edges):
+    X0, Y1, p = g
+    h, w = z.shape
+    ok = ~np.isnan(z)
+    rgba = np.zeros((h, w, 4), np.uint8)
+    pal = np.array([[int(c[i:i + 2], 16) for i in (1, 3, 5)] for c in DEM_PAL], np.uint8)
+    rgba[ok, :3] = pal[np.digitize(z[ok], edges[1:-1])]
+    rgba[ok, 3] = 255
+    return Image.fromarray(rgba), [X0, X0 + w * p, Y1 - h * p, Y1]
+
+
+def geotiff_bytes(a, g, nodata, epsg=3857):
+    X0, Y1, p = g
+    ifd = TiffImagePlugin.ImageFileDirectory_v2()
+    ifd[33550], ifd[33922] = (p, p, 0.0), (0.0, 0.0, 0.0, float(X0), float(Y1), 0.0)
+    ifd[34735] = (1, 1, 0, 3, 1024, 0, 1, 1, 1025, 0, 1, 1, 3072, 0, 1, epsg)
+    ifd[42113] = str(nodata)
+    buf = io.BytesIO()
+    Image.fromarray(a).save(buf, "TIFF", tiffinfo=ifd, compression="tiff_deflate")
+    return buf.getvalue()
+
+
+# ---------------- viewshed + vantage-point selection ----------------
+def bilin(a, x, y):
+    h, w = a.shape
+    x, y = np.clip(x, 0, w - 1.001), np.clip(y, 0, h - 1.001)
+    x0, y0 = x.astype(int), y.astype(int)
+    fx, fy = x - x0, y - y0
+    return (a[y0, x0] * (1 - fx) * (1 - fy) + a[y0, x0 + 1] * fx * (1 - fy) +
+            a[y0 + 1, x0] * (1 - fx) * fy + a[y0 + 1, x0 + 1] * fx * fy)
+
+
+def viewshed(z, g, ox, oy, h_obs, h_tgt, rad):
+    """Line of sight from (ox, oy) [EPSG:3857] -> (row0, col0, bool window) or None if outside the DEM."""
+    X0, Y1, p = g
+    pm = p * math.cos(math.radians(unmerc(ox, oy)[1]))
+    c, r = (ox - X0) / p - .5, (Y1 - oy) / p - .5
+    ci, ri, (H, W), rp = int(round(c)), int(round(r)), z.shape, rad / pm
+    if not (0 <= ci < W and 0 <= ri < H):
+        return None
+    k = int(math.ceil(rp)) + 1
+    r0, r1, c0, c1 = max(ri - k, 0), min(ri + k + 1, H), max(ci - k, 0), min(ci + k + 1, W)
+    sub, oc, orr = z[r0:r1, c0:c1], c - c0, r - r0
+    z0 = float(sub[ri - r0, ci - c0]) + h_obs
+    A, d = max(360, int(2 * math.pi * rp * 1.5)), np.arange(1, int(rp * 2) + 2) * .5
+    a = np.linspace(0, 2 * math.pi, A, endpoint=False)[:, None]
+    dm = d * pm
+    hh = bilin(sub, oc + np.cos(a) * d, orr - np.sin(a) * d) - VS_CC * dm ** 2 / (2 * R)
+    prev = np.maximum.accumulate((hh - z0) / dm, axis=1)
+    prev = np.concatenate([np.full((A, 1), -np.inf), prev[:, :-1]], axis=1)
+    vis = (hh + h_tgt - z0) / dm >= prev
+    yy, xx = np.mgrid[0:r1 - r0, 0:c1 - c0]
+    dx, dy = xx - oc, orr - yy
+    dist = np.hypot(dx, dy)
+    ai = np.round(np.arctan2(dy, dx) % (2 * math.pi) / (2 * math.pi) * A).astype(int) % A
+    win = vis[ai, np.clip(np.round(dist * 2).astype(int) - 1, 0, len(d) - 1)] & (dist * pm <= rad)
+    win[ri - r0, ci - c0] = True
+    return r0, c0, win
+
+
+def vantage_batches(pts, h_obs, h_tgt, rad):
+    """pts = ((lon, lat, name), ...) WTGs. Greedy vantage selection, VS_BATCHES distinct batches, real viewshed summed into a count raster."""
+    lo, la = [q[0] for q in pts], [q[1] for q in pts]
+    m = (rad + 300) / 111320
+    cl = math.cos(math.radians(sum(la) / len(la)))
+    e, g = dem_grid((min(lo) - m / cl, min(la) - m, max(lo) + m / cl, max(la) + m), 13, 9)
+    X0, Y1, p = g
+    H, W = e.shape
+    lo_e, hi_e = float(np.nanmin(e)), float(np.nanmax(e))
+    zf = np.where(np.isnan(e), lo_e, e)
+    nrm = (zf - lo_e) / ((hi_e - lo_e) or 1.0)
+    pm = p * cl
+    obs = [merc(x, y) for x, y, _ in pts]
+    cell = lambda x, y: (int(round((Y1 - y) / p - .5)), int(round((x - X0) / p - .5)))
+    excl = np.zeros((H, W), bool)
+    for x, y in obs:
+        r, c = cell(x, y)
+        excl[max(r - 1, 0):r + 2, max(c - 1, 0):c + 2] = True
+    wins = [viewshed(zf, g, x, y, h_obs, h_tgt, rad) for x, y in obs]
+    sees = lambda w, r, c: bool(w) and 0 <= r - w[0] < w[2].shape[0] and 0 <= c - w[1] < w[2].shape[1] and w[2][r - w[0], c - w[1]]
+    bp, used, out = max(1, int(round(VS_EXCL_M / pm))), np.zeros((H, W), bool), []
+    for _ in range(VS_BATCHES):
+        left, sel = set(range(len(pts))), []
+        while left:
+            cov = np.zeros((H, W), np.float32)
+            for i in left:
+                if wins[i]:
+                    r0, c0, w = wins[i]
+                    cov[r0:r0 + w.shape[0], c0:c0 + w.shape[1]] += w
+            cov[excl | used] = 0
+            if cov.max() == 0:
+                break
+            r, c = np.unravel_index(np.argmax(np.where(cov > 0, cov + nrm * VS_ELEV_W, 0)), cov.shape)
+            hit = [i for i in left if sees(wins[i], r, c)]
+            left -= set(hit)
+            x, y = X0 + (c + .5) * p, Y1 - (r + .5) * p
+            lon, lat = unmerc(x, y)
+            sel.append({"x": x, "y": y, "lon": lon, "lat": lat, "wtg_count": len(hit),
+                        "elev_m": float(e[r, c]) if not np.isnan(e[r, c]) else 0.0, "wtg_names": ", ".join(pts[i][2] for i in hit)})
+            used[max(r - bp, 0):r + bp + 1, max(c - bp, 0):c + bp + 1] = True
+        cum = np.zeros((H, W), np.uint16)
+        for s in sel:
+            w = viewshed(zf, g, s["x"], s["y"], h_obs, h_tgt, rad)
+            if w:
+                cum[w[0]:w[0] + w[2].shape[0], w[1]:w[1] + w[2].shape[1]] += w[2]
+        out.append({"pts": sel, "cov": cum, "left": len(left), "missed": ", ".join(pts[i][2] for i in sorted(left))})
+    return {"g": g, "batches": out}
+
+
+def vp_kml(n, bt):
+    return to_kml(f"Vantage Points Batch {n}",
+                  [(f"Vantage {i}", Point(q["lon"], q["lat"]),
+                    {"batch": n, "wtg_count": q["wtg_count"], "elev_m": round(q["elev_m"], 2), "wtg_names": q["wtg_names"]})
+                   for i, q in enumerate(bt["pts"], 1)], VS_COL[(n - 1) % 3])
+
+
+def wtg_buffer(pts, rad):
+    u = gpd.GeoSeries([Point(x, y) for x, y, _ in pts], crs=4326)
+    u = u.to_crs(u.estimate_utm_crs())
+    return json.loads(gpd.GeoSeries([unary_union(list(u.buffer(rad)))], crs=u.crs).to_crs(4326).to_json())
+
+
+def cov_png(cov, g, col):
+    """Visibility count raster -> (PNG data URL, [[S, W], [N, E]]); more WTGs visible = darker / more opaque."""
+    X0, Y1, p = g
+    h, w = cov.shape
+    m, rgba = cov.astype(np.float32), np.zeros((h, w, 4), np.uint8)
+    base = np.array([int(col[i:i + 2], 16) for i in (1, 3, 5)], np.float32)
+    k = np.where(m > 0, 1.0 - 0.45 * m / max(float(m.max()), 1), 1.0)[..., None]  # more WTGs -> darker shade
+    rgba[..., :3] = np.clip(base * k, 0, 255).astype(np.uint8)
+    rgba[..., 3] = np.where(m > 0, 150 + 105 * m / max(float(m.max()), 1), 0).astype(np.uint8)
+    im = Image.fromarray(rgba)
+    if max(im.size) > VS_RAS_MAXPX:   # keep the data URL small so the map iframe always loads it
+        f = VS_RAS_MAXPX / max(im.size)
+        im = im.resize((max(1, round(w * f)), max(1, round(h * f))), Image.Resampling.NEAREST)
+    buf = io.BytesIO()
+    im.save(buf, "PNG", optimize=True)
+    (lo0, la0), (lo1, la1) = unmerc(X0, Y1 - h * p), unmerc(X0 + w * p, Y1)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(), [[la0, lo0], [la1, lo1]]
+
+
+# =====================================================================================
+# EXPORT WORKER
+# =====================================================================================
+def pm_src(aid):
+    rd = reader(aid)
+    h = rd.header()
+
+    def get(z, x, y):
+        data = rd.get(z, x, y)
+        return Image.open(io.BytesIO(data)) if data else None
+    return h["min_zoom"], h["max_zoom"], get, sheet_bounds(aid)
+
+
+xyz_src = lambda url: (0, 19, lambda z, x, y: web_img(url.format(z=z, x=x, y=y)), None)
+
+
+def mosaic(src, bounds, max_tiles, on_tile=None):
+    zmin, z, get, sb = src
+    if sb:
+        bounds = [max(bounds[0], sb[0]), max(bounds[1], sb[1]), min(bounds[2], sb[2]), min(bounds[3], sb[3])]
+        if bounds[0] >= bounds[2] or bounds[1] >= bounds[3]:
+            return None
+    n, x0, x1, y0, y1 = tile_range(bounds, z)
+    while z > zmin and (x1 - x0 + 1 > max_tiles or y1 - y0 + 1 > max_tiles):
+        z -= 1
+        n, x0, x1, y0, y1 = tile_range(bounds, z)
+    if z == zmin and zmin > 8 and (x1 - x0 + 1 > max_tiles or y1 - y0 + 1 > max_tiles):
+        return None   # detail part (z13+) is too coarse-extent for this export; the all-India part covers it
+    canvas = Image.new("RGBA", ((x1 - x0 + 1) * 256, (y1 - y0 + 1) * 256), (0, 0, 0, 0))
+    tiles = [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
+
+    def read(zl, x, y):
+        for a in range(3):
+            try:
+                im = get(zl, x, y)
+                if im is None:
+                    return None
+                t = im.convert("RGBA")
+                return t if t.size == (256, 256) else t.resize((256, 256), Image.Resampling.BILINEAR)
+            except Exception:
+                time.sleep(.3 * (a + 1))
+
+    def load(xy):  # missing tile -> upscale parent tile
+        x, y = xy
+        for s in range(min(3, z - zmin) + 1):
+            t = read(z - s, x >> s, y >> s)
+            if t is not None:
+                if s:
+                    q, m = 256 >> s, (1 << s) - 1
+                    cx0, cy0 = (x & m) * q, (y & m) * q
+                    t = t.crop((cx0, cy0, cx0 + q, cy0 + q)).resize((256, 256), Image.Resampling.BICUBIC)
+                return xy, t
+        return xy, None
+
+    with ThreadPoolExecutor(max_workers=TILE_WORKERS) as ex:
+        for i, (xy, t) in enumerate(ex.map(load, tiles), 1):
+            if t is not None:
+                canvas.alpha_composite(t, ((xy[0] - x0) * 256, (xy[1] - y0) * 256))
+                del t
+            if on_tile:
+                on_tile(i, len(tiles))
+    ts = 2 * math.pi * R / n
+    return canvas, [-math.pi * R + x0 * ts, -math.pi * R + (x1 + 1) * ts,
+                    math.pi * R - (y1 + 1) * ts, math.pi * R - y0 * ts]
+
+
+merc = lambda lon, lat: (R * math.radians(lon), R * math.asinh(math.tan(math.radians(lat))))
+unmerc = lambda x, y: (math.degrees(x / R), math.degrees(math.atan(math.sinh(y / R))))
+
+
+def get_font(size, bold=False):
+    names = (["DejaVuSans-Bold.ttf", "LiberationSans-Bold.ttf", "arialbd.ttf"] if bold
+             else ["DejaVuSans.ttf", "LiberationSans-Regular.ttf", "arial.ttf"])
+    for n in names:
+        for p in (os.path.join(FONT_DIR, n), n):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    try:
+        return ImageFont.load_default(size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def put_text(d, xy, s, font, anchor="la"):
+    try:
+        d.text(xy, s, font=font, fill="black", anchor=anchor)
+    except ValueError:
+        d.text(xy, s, font=font, fill="black")
+
+
+def center_text(d, s, cx, cy, w, h, size, bold=False):
+    s = " ".join(s.split())
+    for sz in range(size, 5, -1):
+        f, sp = get_font(sz, bold), sz * .2
+        lines, cur = [], ""
+        for word in s.split(" "):
+            t = (cur + " " + word).strip()
+            if not cur or d.textlength(t, font=f) <= w:
+                cur = t
+            else:
+                lines.append(cur)
+                cur = word
+        t = "\n".join(lines + [cur])
+        bb = d.multiline_textbbox((0, 0), t, font=f, spacing=sp, align="center")
+        if bb[2] - bb[0] <= w and bb[3] - bb[1] <= h:
+            break
+    d.multiline_text((cx - (bb[0] + bb[2]) / 2, cy - (bb[1] + bb[3]) / 2), t, font=f, fill="black",
+                     align="center", spacing=sp)
+
+
+def prepared_by(img, d, cx, ya, yb, w, size, logo_bytes, logo_h):
+    li = None
+    if logo_bytes:
+        try:
+            li = Image.open(io.BytesIO(logo_bytes)).convert("RGB")
+        except Exception:
+            pass
+    if li is None:
+        center_text(d, "Prepared by Kosher Climate", cx, (ya + yb) / 2, w * .92, (yb - ya) * .8, size, True)
+        return
+    f, label, gap = get_font(size, True), "Prepared by", max(4, int(size * .5))
+    tw = d.textlength(label, font=f)
+    h = max(8, min(int((yb - ya) * .98), logo_h))
+    lw = int(li.width * h / li.height)
+    room = w * .92 - tw - gap
+    if lw > room > 20:
+        lw, h = int(room), max(4, int(li.height * room / li.width))
+    lw, h = max(int(lw * LOGO_SCALE), 1), max(int(h * LOGO_SCALE), 4)
+    li = li.resize((lw, h), Image.Resampling.LANCZOS)
+    x, cy = cx - (tw + gap + li.width) / 2, (ya + yb) / 2
+    put_text(d, (x, cy), label, f, "lm")
+    img.paste(li, (int(x + tw + gap), int(cy - li.height / 2)))
+
+
+nice_step = lambda raw: next((s for s in (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10) if s >= raw), 10)
+
+
+def geom_paths(g):
+    t = g.geom_type
+    if t == "Polygon":
+        yield [c[:2] for c in g.exterior.coords]
+        for r in g.interiors:
+            yield [c[:2] for c in r.coords]
+    elif t in ("LineString", "LinearRing"):
+        yield [c[:2] for c in g.coords]
+    elif t == "Point":
+        yield [(g.x, g.y)]
+    elif hasattr(g, "geoms"):
+        for sub in g.geoms:
+            yield from geom_paths(sub)
+
+
+def draw_path(d, pts, color, width, dash=None):
+    if len(pts) == 1:
+        x, y = pts[0]
+        d.ellipse([x - width * 2, y - width * 2, x + width * 2, y + width * 2], outline=color, width=width)
+        return
+    if not dash:
+        d.line(pts, fill=color, width=width, joint="curve")
+        return
+    on, off = dash
+    period, pos = on + off, 0.0
+    for (x0, y0), (x1, y1) in zip(pts[:-1], pts[1:]):
+        seg = math.hypot(x1 - x0, y1 - y0)
+        if seg == 0:
+            continue
+        ux, uy, t = (x1 - x0) / seg, (y1 - y0) / seg, 0.0
+        while t < seg:
+            ph = pos % period
+            run = min((on if ph < on else period) - ph, seg - t)
+            if ph < on:
+                d.line([(x0 + ux * t, y0 + uy * t), (x0 + ux * (t + run), y0 + uy * (t + run))], fill=color, width=width)
+            t += run
+            pos += run
+
+
+def draw_windmill(d, x, y, s, color="black"):
+    w = max(1, int(s * .12))
+
+    def blades():
+        for a in (90, 210, 330):
+            ca, sa = math.cos(math.radians(a)), math.sin(math.radians(a))
+            yield [(x - sa * s * .1, y - ca * s * .1), (x + s * ca, y - s * sa), (x + sa * s * .1, y + ca * s * .1)]
+
+    d.line([(x, y), (x, y + s * 1.15)], fill="white", width=w * 3)
+    for poly in blades():
+        d.polygon(poly, fill="white", outline="white", width=w)
+    d.line([(x, y), (x, y + s * 1.15)], fill=color, width=w)
+    for poly in blades():
+        d.polygon(poly, fill=color)
+    r = s * .13
+    d.ellipse([x - r, y - r, x + r, y + r], fill=color, outline="white")
+
+
+def draw_fc(md, fc, tp, color, width):
+    if fc and fc["features"]:
+        for geom in gpd.GeoDataFrame.from_features(fc["features"], crs=4326).to_crs(3857).geometry:
+            for path in geom_paths(geom):
+                draw_path(md, [tp(x, y) for x, y in path], color, width)
+
+
+def draw_water(map_img, md, water, tp, pt):
+    for k, fc in (water or {}).items():
+        if not fc["features"]:
+            continue
+        col = DRAIN[k][2]
+        gm = gpd.GeoDataFrame.from_features(fc["features"], crs=4326).to_crs(3857)
+        mask = Image.new("L", map_img.size, 0)
+        mdr = ImageDraw.Draw(mask)
+        for g in gm.geometry:
+            for sub in getattr(g, "geoms", [g]):
+                if sub.geom_type == "Polygon":
+                    mdr.polygon([tp(x, y) for x, y in (c[:2] for c in sub.exterior.coords)], fill=170)
+                    for r in sub.interiors:
+                        mdr.polygon([tp(x, y) for x, y in (c[:2] for c in r.coords)], fill=0)
+        map_img.paste(tuple(int(col[i:i + 2], 16) for i in (1, 3, 5)), (0, 0), mask)
+        del mask, mdr
+        for g in gm.geometry:
+            for sub in getattr(g, "geoms", [g]):
+                for path in geom_paths(sub):
+                    draw_path(md, [tp(x, y) for x, y in path], col, pt(.8) if sub.geom_type == "Polygon" else pt(1.2))
+
+
+def _along(pts, seg, dist):
+    acc = 0.0
+    for (a, b), s in zip(zip(pts[:-1], pts[1:]), seg):
+        if s and acc + s >= dist:
+            t = (dist - acc) / s
+            return a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t
+        acc += s
+    return pts[-1]
+
+
+def draw_contour_labels(map_img, fc, tp, pt, step):
+    if not (fc and fc["features"]):
+        return
+    gm = gpd.GeoDataFrame.from_features(fc["features"], crs=4326).to_crs(3857)
+    font, sw = get_font(pt(8), True), max(1, pt(1.2))
+    probe = ImageDraw.Draw(Image.new("RGBA", (4, 4)))
+    W_, H_ = map_img.size
+    margin, min_len, min_gap, placed = pt(18), pt(90), pt(45), []
+    for geom, e in zip(gm.geometry, gm["elev"]):
+        if e % step:
+            continue
+        txt = str(int(e))
+        for path in geom_paths(geom):
+            pts = [tp(x, y) for x, y in path]
+            seg = [math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(pts[:-1], pts[1:])]
+            L = sum(seg)
+            if L < min_len:
+                continue
+            n = max(1, int(L // pt(700)))
+            for k in range(n):
+                t = L * (k + .5) / n
+                cx_, cy_ = _along(pts, seg, t)
+                if not (margin < cx_ < W_ - margin and margin < cy_ < H_ - margin):
+                    continue
+                if any(math.hypot(cx_ - px, cy_ - py) < min_gap for px, py in placed):
+                    continue
+                wdw = pt(14)
+                p0, p1 = _along(pts, seg, max(0, t - wdw)), _along(pts, seg, min(L, t + wdw))
+                ang = math.degrees(math.atan2(-(p1[1] - p0[1]), p1[0] - p0[0]))
+                ang = ang - 180 if ang > 90 else ang + 180 if ang < -90 else ang
+                bb = probe.textbbox((0, 0), txt, font=font, stroke_width=sw)
+                pad = sw + 2
+                tile = Image.new("RGBA", (bb[2] - bb[0] + 2 * pad, bb[3] - bb[1] + 2 * pad), (0, 0, 0, 0))
+                ImageDraw.Draw(tile).text((pad - bb[0], pad - bb[1]), txt, font=font, fill="black",
+                                          stroke_width=sw, stroke_fill="white")
+                rot = tile.rotate(ang, expand=True, resample=Image.Resampling.BICUBIC)
+                map_img.paste(rot, (int(cx_ - rot.width / 2), int(cy_ - rot.height / 2)), rot)
+                placed.append((cx_, cy_))
+
+
+def paste_mosaic(map_img, canvas, ext, ox, oy, scale, mx0, my0):
+    dx0, dx1 = ox + ext[0] * scale - mx0, ox + ext[1] * scale - mx0
+    dy0, dy1 = oy - ext[3] * scale - my0, oy - ext[2] * scale - my0
+    if dx1 <= dx0 or dy1 <= dy0:
+        return
+    tx0, ty0 = int(math.floor(max(dx0, 0))), int(math.floor(max(dy0, 0)))
+    tx1, ty1 = int(math.ceil(min(dx1, map_img.width))), int(math.ceil(min(dy1, map_img.height)))
+    if tx1 <= tx0 or ty1 <= ty0:
+        return
+    sw, sh = canvas.size
+    fx, fy = sw / (dx1 - dx0), sh / (dy1 - dy0)
+    bx = (max(0.0, (tx0 - dx0) * fx), max(0.0, (ty0 - dy0) * fy),
+          min(float(sw), (tx1 - dx0) * fx), min(float(sh), (ty1 - dy0) * fy))
+    if bx[2] > bx[0] and bx[3] > bx[1]:
+        part = canvas.resize((tx1 - tx0, ty1 - ty0), Image.Resampling.BILINEAR, box=bx)
+        map_img.paste(part, (tx0, ty0), part)
+
+
+def whiten_outside(map_img, geoms, tp):
+    mask = Image.new("L", map_img.size, 255)
+    md = ImageDraw.Draw(mask)
+    for g in geoms:
+        for sub in getattr(g, "geoms", [g]):
+            if sub.geom_type == "Polygon":
+                md.polygon([tp(x, y) for x, y in (c[:2] for c in sub.exterior.coords)], fill=0)
+                for r in sub.interiors:
+                    md.polygon([tp(x, y) for x, y in (c[:2] for c in r.coords)], fill=255)
+    map_img.paste((255, 255, 255), (0, 0), mask)
+
+
+def export_map(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, progress, out_path, kind="Toposheet Map", ex=None):
+    ex = ex or {}
+    has_dem, has_con, has_rd, has_wt, has_sat = KINDS[kind]
+    topo = not any(KINDS[kind])
+    pt = lambda v: max(1, int(round(v * dpi / 72)))
+    W, H = int(16 * dpi), int(11 * dpi)
+    mx0, mx1, my0, my1 = int(.035 * W), int(.75 * W), int(.055 * H), int(.935 * H)
+    px0, px1 = mx1, int(.995 * W)
+    mw, mh, pw, ph = mx1 - mx0, my1 - my0, px1 - px0, my1 - my0
+
+    progress(0.01, "Preparing extent...")
+    to_m = lambda gj: gpd.GeoDataFrame.from_features(gj["features"], crs=4326).to_crs(3857).geometry
+    for l in layers:
+        l["site"], l["bufs"] = to_m(l["site"]), [dict(b, gj=to_m(b["gj"])) for b in l["bufs"]]
+    if layers:
+        bs = [g.total_bounds for l in layers for g in [l["site"]] + [b["gj"] for b in l["bufs"]]]
+        b = [min(v[0] for v in bs), min(v[1] for v in bs), max(v[2] for v in bs), max(v[3] for v in bs)]
+        dx, dy = (b[2] - b[0]) * .075, (b[3] - b[1]) * .075
+        vx0, vx1, vy0, vy1 = b[0] - dx, b[2] + dx, b[1] - dy, b[3] + dy
+    else:
+        with ThreadPoolExecutor(max_workers=TILE_WORKERS) as exr:
+            sbs = [b for b in exr.map(sheet_bounds, sheets_pm) if b]
+        bb = ([min(b[0] for b in sbs), min(b[1] for b in sbs), max(b[2] for b in sbs), max(b[3] for b in sbs)]
+              if sbs else [68, 6, 98, 36])
+        (vx0, vy0), (vx1, vy1) = merc(bb[0], bb[1]), merc(bb[2], bb[3])
+
+    scale = min(mw / (vx1 - vx0), mh / (vy1 - vy0))
+    cx, cy = (vx0 + vx1) / 2, (vy0 + vy1) / 2
+    ox, oy = mx0 + mw / 2 - cx * scale, my0 + mh / 2 + cy * scale
+    (lon0, lat0) = unmerc((mx0 - ox) / scale, (oy - my1) / scale)
+    (lon1, lat1) = unmerc((mx1 - ox) / scale, (oy - my0) / scale)
+    bbox = [lon0, lat0, lon1, lat1]
+    tp = lambda x, y: (ox + x * scale - mx0, oy - y * scale - my0)
+
+    def overlaps(aid):
+        sb = sheet_bounds(aid)
+        return sb is None or not (sb[2] <= bbox[0] or sb[0] >= bbox[2] or sb[3] <= bbox[1] or sb[1] >= bbox[3])
+
+    with ThreadPoolExecutor(max_workers=16) as exr:
+        list(exr.map(sheet_bounds, sheets_pm))
+    sheets_pm = [a for a in sheets_pm if overlaps(a)]
+    items = [(os.path.basename(a), lambda a=a: pm_src(a)) for a in sheets_pm] + \
+            ([("basemap", lambda: xyz_src(ex["base"]))] if ex.get("base") else [])
+    n = max(len(items), 1)
+    max_tiles = min(16, math.ceil(max(mw, mh) / 256))
+
+    map_img, skipped = Image.new("RGB", (mw, mh), "white"), []
+    for i, (nm, mk) in enumerate(items):
+        for attempt in range(3):
+            try:
+                res = mosaic(mk(), bbox, max_tiles,
+                             lambda dn, t, idx=i, nm=nm: progress((idx + dn / t) / n * 0.75,
+                                                                  f"Fetching tiles: {nm} {idx + 1}/{n} ({dn}/{t})"))
+                if res:
+                    paste_mosaic(map_img, res[0], res[1], ox, oy, scale, mx0, my0)
+                    del res
+                break
+            except Exception:
+                time.sleep(2)
+        else:
+            skipped.append(nm)
+        gc.collect()
+    if items and len(skipped) == len(items) and (sheets_pm or has_sat):
+        raise RuntimeError("None of the selected sources could be loaded: " + ", ".join(skipped))
+    if has_sat and layers:
+        whiten_outside(map_img, [g for l in layers for g in (l["bufs"][-1]["gj"] if l["bufs"] else l["site"])], tp)
+    if has_dem:
+        z, gtr, edges = ex["dem"]
+        im, e3 = dem_rgba(z, gtr, edges)
+        paste_mosaic(map_img, im, e3, ox, oy, scale, mx0, my0)
+        del im
+
+    progress(0.8, "Drawing map overlay and legend...")
+    md = ImageDraw.Draw(map_img)
+    if has_wt:
+        draw_water(map_img, md, ex.get("water"), tp, pt)
+    gdash, gcol = (pt(1.5), pt(3)), (110, 110, 110)
+    xlabels, ylabels = [], []
+    for vertical, a, b in ((True, lon0, lon1), (False, lat0, lat1)):
+        stp = nice_step(max(b - a, 1e-6) / 5)
+        dec = max(0, -int(math.floor(math.log10(stp))))
+        for k in range(math.ceil(a / stp), math.floor(b / stp) + 1):
+            v = k * stp
+            if vertical:
+                p = tp(*merc(v, lat0))[0]
+                draw_path(md, [(p, 0), (p, mh)], gcol, 1, gdash)
+                xlabels.append((p + mx0, f"{v:.{dec}f}°"))
+            else:
+                p = tp(*merc(lon0, v))[1]
+                draw_path(md, [(0, p), (mw, p)], gcol, 1, gdash)
+                ylabels.append((p + my0, f"{v:.{dec}f}°"))
+
+    if has_con:
+        draw_fc(md, ex.get("contours"), tp, CON_COL, pt(.8))
+    if has_rd:
+        draw_fc(md, ex.get("roads"), tp, ROAD_COL, pt(1.2))
+    vec, wm = [], []
+    for l in layers:
+        dash, n_, cols = ((pt(6), pt(4)) if l["dash"] else None), len(l["bufs"]), l.get("cols", COLORS)
+        for geoms, c, lw in [(b["gj"], buf_color(i, n_, cols), 2) for i, b in enumerate(l["bufs"])] + \
+                    [(l["site"], l.get("scol", COLORS[0]), V2_EXP_W if l.get("v2") else SITE_W)]:
+            for g in geoms:
+                for path in geom_paths(g):
+                    pts_ = [tp(x, y) for x, y in path]
+                    if len(pts_) == 1:
+                        wm.append((pts_[0], c if l.get("v2") else None))   # colour => plain dot, None => windmill
+                    else:
+                        vec.append((pts_, c, pt(lw), dash))
+    if has_sat:
+        for pts, c, lw, dash in vec:      # white halo only on satellite maps
+            draw_path(md, pts, "white", lw + pt(1))
+    for pts, c, lw, dash in vec:          # lines and buffers on every map type
+        draw_path(md, pts, c, lw, dash)
+    for (x_, y_), dc in wm:
+        if dc:   # Vector 2 point -> plain dot in its colour
+            r_ = pt(5)
+            md.ellipse([x_ - r_, y_ - r_, x_ + r_, y_ + r_], fill=dc, outline="white", width=max(1, pt(1.5)))
+        else:    # Vector 1 point -> windmill
+            draw_windmill(md, x_, y_, pt(12))
+    if has_con:
+        draw_contour_labels(map_img, ex.get("contours"), tp, pt, LABEL_STEP)
+
+    img = Image.new("RGB", (W, H), "white")
+    img.paste(map_img, (mx0, my0))
+    del map_img
+    d = ImageDraw.Draw(img)
+    d.rectangle([mx0 - 1, my0 - 1, mx1, my1], outline="black", width=pt(1))
+    f_tick = get_font(pt(9))
+    for x, lab in xlabels:
+        put_text(d, (x, my1 + pt(4)), lab, f_tick, "mt")
+    for y, lab in ylabels:
+        put_text(d, (mx0 - pt(4), y), lab, f_tick, "rm")
+    put_text(d, ((mx0 + mx1) / 2, H * .03), "Topographic MAP" if topo else kind, get_font(pt(22), True), "mm")
+    PX = lambda u: px0 + u * pw
+    PY = lambda v: my1 - v * ph
+    d.rectangle([px0, my0, px1, my1], outline="black", width=pt(1.5))
+    px_per_km = 1000 * scale / math.cos(math.radians(unmerc(cx, cy)[1]))
+    km = max([0.1] + [c for c in (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50) if c * px_per_km <= pw * .65])
+    bl, bx, by = km * px_per_km, PX(.06), PY(.945)
+    d.line([(bx, by), (bx + bl, by)], fill="black", width=pt(1.5))
+    f_sb = get_font(pt(10), True)
+    for frac, lab in ((0, "0"), (.5, f"{km / 2:g}"), (1, f"{km:g} km")):
+        d.line([(bx + bl * frac, by), (bx + bl * frac, by - pt(5))], fill="black", width=pt(1.5))
+        put_text(d, (bx + bl * frac, by - pt(7)), lab, f_sb, "ms")
+
+    put_text(d, (PX(.82), PY(.975)), "N", get_font(pt(22), True), "mm")
+    ax_, ay_, hh, ww = PX(.82), PY(.929), pt(13), pt(10)
+    top, lft, rgt, mid = (ax_, ay_ - hh), (ax_ - ww, ay_ + hh), (ax_ + ww, ay_ + hh), (ax_, ay_ + hh * .45)
+    d.polygon([top, lft, mid], fill="black")
+    d.polygon([top, mid, rgt], fill="white", outline="black", width=pt(1.2))
+    d.line([top, lft, mid, top], fill="black", width=pt(1.2))
+
+    rows = legend_rows(layers)
+    lrows = [] if has_sat else line_rows(has_rd, has_con, ex.get("water") if has_wt else None)
+    nrow = len(rows) + len(lrows)
+    sep = min(.5 if topo else .46 if has_dem else .22, .672 - .03 * nrow + .02)
+    for v in (.905, .74, sep):
+        d.line([(px0, PY(v)), (px1, PY(v))], fill="black", width=pt(1))
+    tt, tb = PY(.905), PY(.74)
+    put_text(d, (PX(.5), tt + (tb - tt) * .13), "Title :", get_font(pt(TITLE_HEAD_FS), True), "mm")
+    center_text(d, title, PX(.5), tt + (tb - tt) * .58, pw * .88, (tb - tt) * .62, pt(TITLE_FS))
+
+    put_text(d, (PX(.5), PY(.715)), "Legends", get_font(pt(LEG_HEAD_FS), True), "mm")
+    f_leg, y = get_font(pt(LEG_FS)), .672
+    if not (topo or has_dem) and nrow:
+        y = min(.672, (.69 + sep) / 2 + (.03 * (nrow - 1) + .02) / 2 - .02)
+    for lab, c, lw, dashed, icon in rows:
+        x0_, x1_, y0_, y1_ = PX(.06), PX(.19), PY(y + .02), PY(y)
+        if icon == "dot":
+            r_, mx_, my_ = pt(5), (x0_ + x1_) / 2, (y0_ + y1_) / 2
+            d.ellipse([mx_ - r_, my_ - r_, mx_ + r_, my_ + r_], fill=c, outline="white", width=max(1, pt(1.5)))
+        elif icon:
+            draw_windmill(d, (x0_ + x1_) / 2, (y0_ + y1_) / 2 - ph * .006, ph * .011)
+        else:
+                        draw_path(d, [(x0_, y0_), (x1_, y0_), (x1_, y1_), (x0_, y1_), (x0_, y0_)], c, pt(lw), (pt(6), pt(4)) if dashed else None)
+        put_text(d, (PX(.22), PY(y + .01)), lab, f_leg, "lm")
+        y -= .03
+    for lab, c, lw, sty in lrows:
+        if sty == "fill":
+            d.rectangle([PX(.06), PY(y + .02), PX(.19), PY(y)], fill=tint(c), outline=c, width=pt(lw))
+        else:
+            d.line([(PX(.06), PY(y + .01)), (PX(.19), PY(y + .01))], fill=c, width=pt(lw))
+        put_text(d, (PX(.22), PY(y + .01)), lab, f_leg, "lm")
+        y -= .03
+
+    if topo:
+        if legend_bytes:
+            try:
+                li = Image.open(io.BytesIO(legend_bytes)).convert("RGBA")
+                x0_, y0_, x1_, y1_ = int(PX(.005)), int(PY(sep - .005)), int(PX(.995)), int(PY(.005))
+                li = li.resize((x1_ - x0_, y1_ - y0_), Image.Resampling.LANCZOS)
+                img.paste(li, (x0_, y0_), li)
+                del li
+            except Exception:
+                pass
+        f_ft = get_font(pt(12), True)
+        put_text(d, (.15 * W, .975 * H), "Source : Survey of India", f_ft, "lm")
+        put_text(d, (.42 * W, .975 * H), f"Topo sheet No. {sheets_str}", f_ft, "lm")
+    else:
+        wts = [1.2, 1] + ([3] if has_dem else [])
+        u, eg = (sep - .01) / sum(wts), [.005]
+        for w_ in wts:
+            eg.append(eg[-1] + w_ * u)
+        for v in eg[1:-1]:
+            d.line([(px0, PY(v)), (px1, PY(v))], fill="black", width=pt(1))
+        for k, txt in ((0, None), (1, "Source : " + source_text(kind))):
+            ya, yb = PY(eg[k + 1]), PY(eg[k])
+            if txt is None:
+                prepared_by(img, d, PX(.5), ya, yb, pw, pt(11), ex.get("logo"), pt(LOGO_H_PT))
+            else:
+                center_text(d, txt, PX(.5), (ya + yb) / 2, pw * .92, (yb - ya) * .8, pt(11), True)
+        if has_dem:
+            y0r, y1r = PY(sep - .005), PY(eg[2])
+            rh = (y1r - y0r) / 6
+            put_text(d, (PX(.5), y0r + rh / 2), "Elevation in (m)", get_font(pt(12), True), "mm")
+            for i, (c, lb) in enumerate(zip(DEM_PAL, dem_labels(edges))):
+                cy_ = y0r + rh * (i + 1.5)
+                d.rectangle([PX(.1), cy_ - rh * .3, PX(.28), cy_ + rh * .3], fill=c, outline="black", width=pt(.8))
+                put_text(d, (PX(.34), cy_), lb, f_leg, "lm")
+
+    progress(0.9, f"Encoding PNG at {dpi} DPI..." + (f" (skipped: {', '.join(skipped)})" if skipped else ""))
+    tmp = out_path + ".tmp"
+    img.save(tmp, format="PNG", compress_level=3, dpi=(dpi, dpi))
+    del img
+    gc.collect()
+    os.replace(tmp, out_path)
+    return skipped
+
+
+def make_progress(job_dir):
+    def progress(frac, msg):
+        p = os.path.join(job_dir, "progress.json")
+        try:
+            with open(p + ".tmp", "w", encoding="utf-8") as f:
+                json.dump({"progress": frac, "msg": msg}, f)
+            for a in range(8):
+                try:
+                    os.replace(p + ".tmp", p)
+                    return
+                except PermissionError:
+                    time.sleep(.05 * (a + 1))
+        except OSError:
+            pass
+    return progress
+
+
+def worker_main(job_dir):
+    progress = make_progress(job_dir)
+
+    def read(name, mode="rb"):
+        p = os.path.join(job_dir, name)
+        if os.path.exists(p):
+            with open(p, mode, **({"encoding": "utf-8"} if "b" not in mode else {})) as f:
+                return f.read()
+
+    cfg = json.loads(read("input.json", "r"))
+    _S.sig.update(cfg.get("sig") or {})
+    for a, v, b in cfg.get("bounds") or []:
+        _S.bounds[(a, v)] = tuple(b)
+    ex = {"base": cfg.get("base"), "logo": read("logo.bin")}
+    if os.path.exists(os.path.join(job_dir, "dem.npz")):
+        with np.load(os.path.join(job_dir, "dem.npz")) as nz:
+            ex["dem"] = (nz["z"], tuple(nz["g"]), nz["edges"].tolist())
+    for k in ("contours", "roads", "water"):
+        txt = read(k + ".json", "r")
+        if txt:
+            ex[k] = json.loads(txt)
+    progress(0.0, "Starting export process...")
+    skipped = export_map(cfg["sheets_pm"], cfg["layers"], cfg["title"], cfg["sheets_str"], cfg["dpi"], read("legend.png"),
+                         progress, os.path.join(job_dir, "result.png"), cfg["kind"], ex)
+    if skipped:
+        with open(os.path.join(job_dir, "warn.txt"), "w") as f:
+            f.write(", ".join(skipped))
+
+
+# =====================================================================================
+# GEOREFERENCING WORKER
+# =====================================================================================
+def geo_corners(cv2, rgb, dpi):
+    mask = cv2.inRange(cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV), (120, 50, 50), (170, 255, 255))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    best, amax = None, 10000
+    for c in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+        a = cv2.contourArea(c)
+        ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True) if a > amax else ()
+        if len(ap) == 4:
+            best, amax = ap, a
+    if best is None:
+        raise RuntimeError("grid not detected (magenta neatline frame not found in the PDF)")
+    s = best.reshape(-1, 2).astype(np.float32)
+    s = s[s[:, 1].argsort()]
+    tl, tr = s[:2][s[:2][:, 0].argsort()]
+    bl, br = s[2:][s[2:][:, 0].argsort()]
+    base = np.array([tl, tr, br, bl])
+    inset = (np.array([2100, 1102]) - np.array([1922, 924])) * (dpi / 300.0)
+    v1, v2 = base[1] - base[0], base[3] - base[0]
+    n1, n2 = v1 / np.linalg.norm(v1), v2 / np.linalg.norm(v2)
+    return [base[0] + inset[0] * n1 + inset[1] * n2, base[1] - inset[0] * n1 + inset[1] * n2,
+            base[2] - inset[0] * n1 - inset[1] * n2, base[3] + inset[0] * n1 - inset[1] * n2]
+
+
+def geo_tif(cv2, img, M, b, path):
+    minx, miny, maxx, maxy = [float(v) for v in b]
+    w = int(max(1, round(float((maxx - minx) * math.hypot(M[0, 0], M[0, 1])))))
+    h = int(max(1, round(float((maxy - miny) * math.hypot(M[1, 0], M[1, 1])))))
+    dx, dy = (maxx - minx) / w, (maxy - miny) / h
+    lon0, lat0 = minx + dx / 2, maxy - dy / 2
+    A = np.ascontiguousarray([[M[0, 0] * dx, -M[1, 0] * dy, M[0, 0] * lon0 + M[1, 0] * lat0 + M[2, 0]],
+                              [M[0, 1] * dx, -M[1, 1] * dy, M[0, 1] * lon0 + M[1, 1] * lat0 + M[2, 1]]], np.float64)
+    fl = cv2.WARP_INVERSE_MAP
+    img = np.ascontiguousarray(img)
+    out = cv2.warpAffine(img, A, (w, h), flags=cv2.INTER_CUBIC | fl, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+    msk = cv2.warpAffine(np.full(img.shape[:2], 255, np.uint8), A, (w, h), flags=cv2.INTER_NEAREST | fl,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    keys = (1, 1, 0, 3, 1024, 0, 1, 2, 1025, 0, 1, 1, 2048, 0, 1, 4326)
+    ensure("tifffile", "tifffile").imwrite(
+        path, np.ascontiguousarray(out), photometric="rgb", compression="deflate",
+        extratags=[(33550, "d", 3, (dx, dy, 0.0), True), (33922, "d", 6, (0.0, 0.0, 0.0, minx, maxy, 0.0), True),
+                   (34735, "H", len(keys), keys, True), (42113, "s", 2, "0", True)])
+    return out, msk
+
+
+def geo_tiles(cv2, img, M, b, pm_path, prog):
+    from pmtiles.writer import write
+    from pmtiles.tile import zxy_to_tileid, TileType, Compression
+    minx, miny, maxx, maxy = b
+    lat_c = math.radians((miny + maxy) / 2)
+    res_src = (111320 * math.cos(lat_c) / math.hypot(M[0, 0], M[0, 1]) + 110574 / math.hypot(M[1, 0], M[1, 1])) / 2
+    zlo = GEO_MIN_ZOOM
+    zmax = int(min(20, max(zlo, round(math.log2(156543.03392 * math.cos(lat_c) / res_src)))))
+    f = 156543.03392 * math.cos(lat_c) / 2 ** zmax / res_src
+    src, sx, sy = img, 1.0, 1.0
+    if f > 1.05:
+        src = cv2.resize(img, (max(1, round(img.shape[1] / f)), max(1, round(img.shape[0] / f))), interpolation=cv2.INTER_AREA)
+        sx, sy = src.shape[1] / img.shape[1], src.shape[0] / img.shape[0]
+    n, x0, x1, y0, y1 = tile_range(b, zmax)
+    u = (np.arange(256) + .5) / 256
+    sharp = ImageFilter.UnsharpMask(radius=.8, percent=70, threshold=3)
+
+    def make_tile(x, y):
+        if not (x0 <= x <= x1 and y0 <= y <= y1):
+            return None
+        LON, LAT = np.meshgrid((x + u) / n * 360 - 180, np.degrees(np.arctan(np.sinh(np.pi * (1 - 2 * (y + u) / n)))))
+        inside = (LON >= minx) & (LON <= maxx) & (LAT >= miny) & (LAT <= maxy)
+        if not inside.any():
+            return None
+        px = ((LON * M[0, 0] + LAT * M[1, 0] + M[2, 0] + .5) * sx - .5).astype(np.float32)
+        py = ((LON * M[0, 1] + LAT * M[1, 1] + M[2, 1] + .5) * sy - .5).astype(np.float32)
+        rgb = cv2.remap(src, px, py, cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        return Image.fromarray(np.dstack([rgb, (inside * 255).astype(np.uint8)]), "RGBA")
+
+    def enc(im):
+        if im.getchannel("A").getextrema()[0] == 255:
+            im = im.convert("RGB")
+        buf = io.BytesIO()
+        im.save(buf, "WEBP", quality=GEO_QUALITY, method=2, **({"alpha_quality": 100} if im.mode == "RGBA" else {}))
+        return buf.getvalue()
+
+    def shrink(kids):
+        cv = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+        for (dx, dy), im in kids.items():
+            cv.paste(im, (dx * 256, dy * 256))
+        r, g, bl, a = cv.resize((256, 256), Image.Resampling.LANCZOS).split()
+        r, g, bl = Image.merge("RGB", (r, g, bl)).filter(sharp).split()
+        return Image.merge("RGBA", (r, g, bl, a))
+
+    def group(pxy):
+        kids = {(dx, dy): t for dy in (0, 1) for dx in (0, 1)
+                if (t := make_tile(2 * pxy[0] + dx, 2 * pxy[1] + dy)) is not None}
+        return [(2 * pxy[0] + dx, 2 * pxy[1] + dy, enc(t)) for (dx, dy), t in kids.items()], (shrink(kids) if kids else None)
+
+    tiles, level = {}, {}
+    with ThreadPoolExecutor(max_workers=max(1, min(os.cpu_count() or 4, 8))) as ex:
+        pxs = sorted({(x >> 1, y >> 1) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)})
+        for i, (pxy, (encd, parent)) in enumerate(zip(pxs, ex.map(group, pxs)), 1):
+            tiles.update({zxy_to_tileid(zmax, x, y): data for x, y, data in encd})
+            if parent is not None:
+                level[pxy] = parent
+            prog(.8 * i / len(pxs), f"cutting tiles z{zmax}")
+        for z in range(zmax - 1, zlo - 1, -1):
+            items = list(level.items())
+            for (x, y), data in zip((k for k, _ in items), ex.map(enc, (v for _, v in items))):
+                tiles[zxy_to_tileid(z, x, y)] = data
+            if z > zlo:
+                grp = defaultdict(dict)
+                for (x, y), im in items:
+                    grp[(x >> 1, y >> 1)][(x & 1, y & 1)] = im
+                level = dict(zip(grp, ex.map(shrink, grp.values())))
+            prog(.8 + .15 * (zmax - z) / max(1, zmax - zlo), f"building overview z{z}")
+
+    prog(.96, "writing tiles")
+    e7 = lambda v: int(round(v * 1e7))
+    with write(pm_path) as w:
+        for tid in sorted(tiles):
+            w.write_tile(tid, tiles[tid])
+        w.finalize({"tile_type": TileType.WEBP, "tile_compression": Compression.NONE, "min_zoom": zlo, "max_zoom": zmax,
+                    "min_lon_e7": e7(minx), "min_lat_e7": e7(miny), "max_lon_e7": e7(maxx), "max_lat_e7": e7(maxy),
+                    "center_zoom": zmax, "center_lon_e7": e7((minx + maxx) / 2), "center_lat_e7": e7((miny + maxy) / 2)},
+                   {"name": os.path.basename(pm_path), "format": "webp", "type": "overlay",
+                    "minzoom": str(zlo), "maxzoom": str(zmax), "bounds": f"{minx},{miny},{maxx},{maxy}"})
+    return zlo, zmax, len(tiles)
+
+
+def save_preview(cv2, img, path):
+    k = min(1.0, PREVIEW_PX / max(img.shape[:2]))
+    pv = cv2.resize(img, (max(1, round(img.shape[1] * k)), max(1, round(img.shape[0] * k))), interpolation=cv2.INTER_AREA)
+    Image.fromarray(pv).save(path, "JPEG", quality=82)
+
+
+def tif_read(path):
+    with ensure("tifffile", "tifffile").TiffFile(path) as t:
+        tg = t.pages[0].tags
+        sc, tie, gk = tg.get(33550), tg.get(33922), tg.get(34735)
+        if sc is None or tie is None:
+            raise RuntimeError("not a georeferenced GeoTIFF (geo tags missing)")
+        v = [int(x) for x in gk.value] if gk else [0, 0, 0, 0]
+        keys = {v[k]: v[k + 3] for k in range(4, 4 + 4 * v[3], 4)}
+        if keys.get(2048) != 4326:
+            raise RuntimeError("GeoTIFF must be in EPSG:4326 (WGS84 lat/lon)")
+        dx, dy = float(sc.value[0]), float(sc.value[1])
+        i, j, _, x0, y0, _ = [float(x) for x in tie.value[:6]]
+        a = t.asarray()
+    if a.ndim == 2:
+        a = np.dstack([a] * 3)
+    elif a.shape[0] in (3, 4) and a.shape[-1] not in (3, 4):
+        a = np.moveaxis(a, 0, -1)
+    a = a[..., :3]
+    if a.dtype != np.uint8:
+        a = (a >> 8).astype(np.uint8) if a.dtype == np.uint16 else \
+            (a.astype(np.float32) * 255 / max(float(a.max()), 1)).astype(np.uint8)
+    h, w = a.shape[:2]
+    minx, maxy = x0 - i * dx, y0 + j * dy
+    if keys.get(1025) == 2:
+        minx, maxy = minx - dx / 2, maxy + dy / 2
+    return np.ascontiguousarray(a), (minx, maxy - h * dy, minx + w * dx, maxy)
+
+
+def tif_one(cv2, path, name, out_dir, prog):
+    prog(.05, "reading GeoTIFF")
+    img, b = tif_read(path)
+    minx, miny, maxx, maxy = b
+    h, w = img.shape[:2]
+    M = np.array([[w / (maxx - minx), 0], [0, -h / (maxy - miny)], [-minx * w / (maxx - minx), maxy * h / (maxy - miny)]], float)
+    save_preview(cv2, img, os.path.join(out_dir, name + ".jpg"))
+    pm = os.path.join(out_dir, name + ".pmtiles")
+    zlo, zmax, nt = geo_tiles(cv2, img, M, b, pm, lambda fr, m: prog(.1 + .88 * fr, m))
+    return {"name": name, "pb": [[miny, minx], [maxy, maxx]], "zoom": [zlo, zmax], "tiles": nt,
+            "tif_mb": None, "pm_mb": round(os.path.getsize(pm) / 1e6, 1)}
+
+
+def georef_one(cv2, pdf_path, name, b, out_dir, dpi, prog):
+    fz = ensure("pymupdf", "pymupdf")
+    prog(.02, "rendering PDF")
+    with fz.open(pdf_path) as doc:
+        pix = doc.load_page(0).get_pixmap(matrix=fz.Matrix(dpi / 72, dpi / 72), alpha=False)
+        img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, 3).copy()
+    prog(.1, "detecting grid")
+    pts = geo_corners(cv2, img, dpi)
+    minx, miny, maxx, maxy = b
+    ll = np.array([(minx, maxy), (maxx, maxy), (maxx, miny), (minx, miny)], float)
+    M = cv2.solve(np.column_stack([ll, np.ones(4)]), np.array(pts, np.float64), flags=cv2.DECOMP_SVD)[1]
+    prog(.15, "writing GeoTIFF")
+    tif, pm = os.path.join(out_dir, name + ".tif"), os.path.join(out_dir, name + ".pmtiles")
+    out, msk = geo_tif(cv2, img, M, b, tif)
+    save_preview(cv2, out, os.path.join(out_dir, name + ".jpg"))
+    del out, msk
+    prog(.25, "cutting tiles")
+    zlo, zmax, nt = geo_tiles(cv2, img, M, b, pm, lambda fr, m: prog(.25 + .73 * fr, m))
+    return {"name": name, "pb": [[miny, minx], [maxy, maxx]], "zoom": [zlo, zmax], "tiles": nt,
+            "tif_mb": round(os.path.getsize(tif) / 1e6, 1), "pm_mb": round(os.path.getsize(pm) / 1e6, 1)}
+
+
+def georef_main(job_dir):
+    progress = make_progress(job_dir)
+    with open(os.path.join(job_dir, "input.json"), encoding="utf-8") as f:
+        cfg = json.load(f)
+    progress(0.0, "Loading libraries...")
+    cv2, results, items = ensure("cv2", "opencv-python-headless"), [], cfg["items"]
+    for i, it in enumerate(items):
+        lo, span = i / len(items), 1 / len(items)
+        try:
+            p, cb = os.path.join(job_dir, it["file"]), lambda fr, m, lo=lo, span=span, nm=it["name"]: progress(lo + span * fr, f"{nm}: {m}")
+            results.append(tif_one(cv2, p, it["name"], job_dir, cb) if it["file"].endswith(".tif")
+                           else georef_one(cv2, p, it["name"], it["bounds"], job_dir, cfg["dpi"], cb))
+        except Exception as e:
+            results.append({"name": it["name"], "error": f"{type(e).__name__}: {e}"})
+        gc.collect()
+    with open(os.path.join(job_dir, "results.json"), "w", encoding="utf-8") as f:
+        json.dump(results, f)
+    progress(1.0, "Done")
+
+
+if __name__ == "__main__" and len(sys.argv) == 3 and sys.argv[1] in ("--export", "--georef"):
+    faulthandler.enable()
+    (worker_main if sys.argv[1] == "--export" else georef_main)(sys.argv[2])
+    sys.exit(0)
+
+
+# =====================================================================================
+# STREAMLIT APP
+# =====================================================================================
+import streamlit as st
+import streamlit.components.v1 as components
+
+if not TOKEN:
+    try:
+        TOKEN = st.secrets.get("HF_TOKEN")
+    except Exception:
+        TOKEN = None
+    if TOKEN:
+        session.headers.update({"Authorization": f"Bearer {TOKEN}"})
+if not R2_BASE:
+    try:
+        R2_BASE = (st.secrets.get("R2_BASE") or "").rstrip("/")
+    except Exception:
+        pass
+
+st.set_page_config(page_title=APP_TITLE, page_icon="🛰️", layout="wide", initial_sidebar_state="collapsed")
+
+if not st.session_state.get("auth"):
+    st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-html{font-size:12.5px;} html,body,[class*="css"],.stApp{font-family:'Inter',sans-serif;}
-.stApp{background:linear-gradient(180deg,#E4F0FE 0%,#F3F8FF 45%,#EAF3FC 100%);}
-[data-testid=stSidebar]{background:linear-gradient(180deg,#0A2A57 0%,#103A78 100%);border-right:none;position:relative;}
-[data-testid=stSidebarContent],[data-testid=stSidebarHeader]{position:static !important;}
-[data-testid=stSidebar] [data-testid=stSidebarUserContent]{padding-top:1rem;}
-[data-testid=stSidebarCollapseButton] *{color:#fff !important;}
-[data-testid=stSidebarCollapseButton]{position:absolute !important;top:50%;right:6px;transform:translateY(-50%);z-index:50;background:rgba(255,255,255,.14);border-radius:8px;}
-[data-testid=stSidebar] [data-testid=stMarkdownContainer] p,[data-testid=stSidebar] label p{color:#DDE8FA !important;font-size:.78rem;}
-[data-testid=stSidebar] [data-testid=stCaptionContainer] *{color:#8FB0E3 !important;}
-[data-testid=stSidebar] [data-testid=stExpander]{border:1px solid rgba(255,255,255,.18) !important;border-radius:10px;background:rgba(255,255,255,.06) !important;}
-[data-testid=stSidebar] [data-testid=stExpander] details,[data-testid=stSidebar] [data-testid=stExpander] details>div,[data-testid=stSidebar] [data-testid=stExpanderDetails],[data-testid=stSidebar] [data-testid=stExpander] summary{background:transparent !important;}
-[data-testid=stSidebar] [data-testid=stExpander] summary,[data-testid=stSidebar] [data-testid=stExpander] summary *{color:#fff !important;font-weight:600;font-size:.8rem;}
-[data-testid=stSidebar] [data-testid=stForm]{border:none !important;padding:0 !important;background:transparent !important;}
-[data-testid=stSidebar] [data-testid=stSliderThumbValue],[data-testid=stSidebar] [data-testid=stTickBarMin],[data-testid=stSidebar] [data-testid=stTickBarMax]{color:#fff !important;}
-[data-stale="true"],div[data-stale="true"]{opacity:1 !important;transition:none !important;}
-.sb-brand{color:#fff;font-weight:800;font-size:1.05rem;} .sb-brand span{color:#7DB8F5;}
-.sb-h{color:#7DB8F5;font-size:.62rem;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;margin:14px 0 4px 0;}
-.block-container{padding-top:.9rem;padding-bottom:1rem;max-width:1600px;}
-#MainMenu,footer,[data-testid=stMainMenu],[data-testid=stToolbarActions],[data-testid=stDecoration],[data-testid=stStatusWidget],.stAppDeployButton{display:none !important;}
-header[data-testid=stHeader]{background:transparent;height:0;}
-[data-testid=stSidebarCollapsedControl],[data-testid=collapsedControl],[data-testid=stExpandSidebarButton]{position:fixed !important;top:50%;left:0;transform:translateY(-50%);z-index:99999;
- display:flex !important;visibility:visible !important;background:#0A2342;border-radius:0 10px 10px 0;padding:10px 4px;box-shadow:2px 2px 8px rgba(10,35,66,.35);}
-[data-testid=stSidebarCollapsedControl] *,[data-testid=collapsedControl] *,[data-testid=stExpandSidebarButton] *{color:#fff !important;fill:#fff !important;}
-.hero{background:#fff;border:1px solid #D6E2F3;border-radius:14px;overflow:hidden;box-shadow:0 3px 10px rgba(10,35,66,.10);margin-bottom:10px;}
-.hero .strip{background:linear-gradient(90deg,#071B3A,#0F3A7D 55%,#1D5FD1);color:#DCE9FF;font-size:.56rem;letter-spacing:.8px;text-transform:uppercase;font-weight:600;padding:3px 16px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;}
-.hero .body{display:flex;align-items:center;gap:10px;padding:5px 16px;flex-wrap:wrap;}
-.hero img{height:28px;} .hero h2{margin:0;font-weight:800;font-size:1.2rem;line-height:1.05;color:#0A2342;}
-.hero small{display:block;color:#5E6E80;font-size:.72rem;} .sp{flex:1;}
-.chip{display:inline-flex;align-items:center;border:1px solid #D0DCEE;background:#fff;color:#0A2342;border-radius:7px;padding:3px 9px;font-size:.68rem;font-weight:500;text-decoration:none;}
-.chip.ok{background:#0A2342;color:#fff !important;border-color:#0A2342;font-weight:600;} a.chip.ok:hover{background:#B42318;border-color:#B42318;}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;} .dot.on{background:#22C55E;box-shadow:0 0 0 3px rgba(34,197,94,.28);} .dot.off{background:#9CA3AF;}
-/* ---- one horizontal bar: 6 tabs + (◀ ▶) + Save ---- */
-.st-key-nav button{border-radius:10px;border:1px solid #C9D8EE;background:#fff;min-height:0;padding:7px 6px;box-shadow:none;}
-.st-key-nav button p{color:#0A2342;font-size:.72rem;font-weight:600;line-height:1.2;white-space:normal;}
-.st-key-nav button[kind=primary]{background:#0A2342 !important;border-color:#0A2342 !important;} .st-key-nav button[kind=primary] p{color:#fff !important;}
-.st-key-nav button:disabled{opacity:.45;}
-.st-key-nav .st-key-arrows [data-testid=stHorizontalBlock]{gap:3px !important;}
-.st-key-nav .st-key-arrows button{background:#EAF1FC;border-color:#B5CBEA;padding:7px 0;}
-.st-key-nav .st-key-savebox button{background:linear-gradient(90deg,#1D5FD1,#0FB5A6) !important;border:none !important;}
-.st-key-nav .st-key-savebox button p{color:#fff !important;font-weight:700;}
-.kpi{background:#fff;border:1px solid #DCE8F7;border-radius:14px;padding:12px 16px;box-shadow:0 4px 14px rgba(47,128,237,.07);display:flex;gap:14px;align-items:center;}
-.kpi .ic{width:40px;height:40px;border-radius:14px;display:flex;align-items:center;justify-content:center;font-size:1.4rem;}
-.kpi .v{font-size:1.15rem;font-weight:800;color:#12325C;line-height:1.1;} .kpi .l{color:#6B84A3;font-size:.7rem;margin-top:2px;}
-.card{background:#fff;border:1px solid #DCE8F7;border-radius:14px;padding:14px 18px;box-shadow:0 4px 14px rgba(47,128,237,.07);}
-.card h4{margin:0 0 8px 0;color:#12325C;font-size:1rem;}
-.row{display:flex;justify-content:space-between;gap:14px;padding:4px 0;border-bottom:1px dashed #E6EEF9;font-size:.78rem;}
-.row span:first-child{color:#6B84A3;} .row span:last-child{color:#12325C;font-weight:600;}
-.badge{padding:3px 10px;border-radius:999px;font-size:.75rem;font-weight:700;}
-.b-ok{background:#DFF7E8;color:#16874A;} .b-warn{background:#FFF1D6;color:#B7791F;} .b-bad{background:#FDE5E5;color:#C53030;} .b-gray{background:#EDF1F7;color:#5A6B82;}
-.ev{background:#fff;border:1px solid #DCE8F7;border-left:6px solid var(--c);border-radius:14px;padding:12px 16px;}
-.ev b{color:#12325C;} .ev .m{color:#6B84A3;font-size:.82rem;margin-top:4px;line-height:1.5;}
-.vbar{position:fixed;right:10px;top:64px;bottom:18px;width:12px;background:#D6E4F7;border-radius:8px;z-index:99998;overflow:hidden;}
-.vfill{width:100%;background:linear-gradient(180deg,#1D5FD1,#0FB5A6);border-radius:8px;}
-.vlbl{position:fixed;right:30px;top:64px;z-index:99998;background:#0A2342;color:#fff;border-radius:8px;padding:5px 10px;font-size:.72rem;font-weight:600;}
-.sv{background:#fff;border:1px solid #DCE8F7;border-radius:14px;overflow:hidden;box-shadow:0 4px 14px rgba(47,128,237,.07);margin-bottom:6px;}
-.sv img{width:100%;height:150px;object-fit:cover;display:block;background:#0A2342;}
-.sv .b{padding:10px 12px;} .sv .b b{color:#12325C;font-size:.88rem;display:block;margin-bottom:4px;}
-.sv .m{color:#6B84A3;font-size:.72rem;line-height:1.65;} .sv .m em{font-style:normal;color:#12325C;font-weight:600;}
-[data-testid=stMain] [data-testid=stExpander]{background:#fff;border:1px solid #DCE8F7;border-radius:14px;}
-[data-testid=stMain] label[data-baseweb=radio]{background:#fff;border:1px solid #C9D8EE;border-radius:10px;padding:5px 13px;margin:0 !important;}
-[data-testid=stMain] label[data-baseweb=radio]>div:first-child{display:none;}
-[data-testid=stMain] label[data-baseweb=radio]:has(input:checked){background:#0A2342;border-color:#0A2342;}
-[data-testid=stMain] label[data-baseweb=radio]:has(input:checked) p{color:#fff !important;}
-[data-testid=stMain] div[role=radiogroup]{gap:6px;flex-wrap:wrap;}
-.lg-card{display:flex;gap:11px;align-items:center;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);border-radius:12px;padding:10px 12px;margin-bottom:8px;}
-.lg-card b{display:block;color:#fff;font-size:.85rem;} .lg-card span{display:block;color:#9DB9E6;font-size:.68rem;}
-.lg-ic{width:34px;height:34px;flex:none;border-radius:10px;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#1D5FD1,#0FB5A6);}
-.lg-ic.ok{background:#16A34A;color:#fff;font-weight:800;}
-[data-testid=stSidebar] [data-testid=stTextInput] input,[data-testid=stSidebar] textarea{background:rgba(255,255,255,.96) !important;color:#0A2342 !important;border-radius:9px;font-size:.8rem;}
-[data-testid=stSidebar] button[kind=primary],[data-testid=stSidebar] button[kind=primaryFormSubmit]{background:linear-gradient(90deg,#1D5FD1,#0FB5A6) !important;border:none !important;color:#fff !important;font-weight:700;border-radius:10px;}
-[data-testid=stSidebar] button[kind=secondary]{background:rgba(255,255,255,.08) !important;border:1px solid rgba(255,255,255,.28) !important;color:#fff !important;border-radius:10px;}
-[data-testid=stSidebar] button p{color:#fff !important;}
-[data-testid=stSidebar] [data-testid=stFileUploaderDropzone]{background:rgba(255,255,255,.08);border:1px dashed rgba(255,255,255,.4);border-radius:12px;}
-[data-testid=stSidebar] [data-testid=stFileUploader] *{color:#fff !important;} [data-testid=stSidebar] [data-testid=stFileUploader] svg{fill:#fff !important;}
-[data-testid=stSidebar] [data-testid=stFileUploaderFile]{background:rgba(255,255,255,.14) !important;border-radius:10px;padding:4px 8px;}
+.stApp{background:radial-gradient(circle at 18% 12%,rgba(138,167,123,.32),transparent 45%),
+  radial-gradient(circle at 85% 88%,rgba(47,93,70,.40),transparent 42%),#14231b!important}
+.block-container{max-width:480px!important;margin:0 auto!important;padding-top:17vh!important}
+[data-testid="stForm"]{background:rgba(255,255,255,.09);backdrop-filter:blur(16px);border:1px solid rgba(255,255,255,.28);
+  border-radius:22px;padding:32px 30px 24px;box-shadow:0 24px 70px rgba(0,0,0,.5)}
+.lg-t{text-align:center;color:#fff;font-size:28px;font-weight:800}
+.lg-s{text-align:center;color:#c7d8c4;font-size:12px;margin:4px 0 16px;line-height:1.5}
+[data-testid="stForm"] label p{color:#e4eddc!important;font-weight:600}
+[data-testid="stForm"] div[data-baseweb="input"],[data-testid="stForm"] div[data-baseweb="base-input"]{background:rgba(255,255,255,.96)!important;border-radius:10px}
+[data-testid="stForm"] input{color:#10223d!important;-webkit-text-fill-color:#10223d!important}
+[data-testid="stForm"] button[kind]{background:linear-gradient(90deg,#2f5d46,#6b8f5e);color:#fff;border:0;border-radius:10px;font-weight:700}
+</style>""", unsafe_allow_html=True)
+    with st.form("login"):
+        st.markdown(f'<div class="lg-t">🛰️ Welcome</div><div class="lg-s">{APP_TITLE}<br>Sign in to continue</div>', unsafe_allow_html=True)
+        u_in, p_in = st.text_input("Username"), st.text_input("Password", type="password")
+        if st.form_submit_button("Sign in", width="stretch"):
+            if hmac.compare_digest(u_in.encode(), LOGIN_USER.encode()) and hmac.compare_digest(p_in.encode(), LOGIN_PASS.encode()):
+                st.session_state["auth"] = True
+                st.rerun()
+            st.error("Invalid username or password")
+    st.stop()
+
+release_assets = st.cache_data(ttl=LIST_TTL, show_spinner=False)(list_assets)
+terrain = st.cache_resource(show_spinner="Loading...", max_entries=3)(build_terrain)
+road_data = st.cache_resource(show_spinner="Loading...", max_entries=4)(build_roads)
+water_data = st.cache_resource(show_spinner="Loading...", max_entries=8)(build_water)
+village_data = st.cache_resource(show_spinner="Loading...", max_entries=4)(build_villages)
+vs_data = st.cache_resource(show_spinner="Loading...", max_entries=2)(vantage_batches)
+
+st.markdown("""<style>
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap");
+:root{--g:#2f5d46;--g2:#4f7f5f;--moss:#8aa77b;--sand:#f6f3ea;--sand2:#e9e4d3;--card:#fffdf7;--line:#d3ccb6;--ink:#26302a;--acc:#b7791f;--acc2:#975f14}
+header[data-testid="stHeader"],section[data-testid="stSidebar"],[data-testid="stSidebarCollapsedControl"],
+[data-testid="stExpandSidebarButton"],[data-testid="stStatusWidget"]{display:none!important}
+.stApp{background:var(--sand);color:var(--ink);font-family:Inter,"Segoe UI",system-ui,sans-serif}
+footer,#MainMenu{visibility:hidden}
+.block-container{max-width:1600px;padding:.9rem 1.5rem .5rem!important}
+html,body,[class*="css"],.stMarkdown,p,span,label{font-size:12px!important}
+.st-key-hdr{background:#fff;border:1px solid var(--line);border-top:4px solid var(--g);border-radius:12px;padding:6px 16px;margin-bottom:8px;box-shadow:0 2px 10px rgba(38,48,42,.08)}
+.st-key-hdr [data-testid="stMarkdownContainer"],.st-key-hdr p{margin:0}
+.st-key-hdr button{background:#fff;color:var(--g);border:1px solid var(--g);min-height:32px}
+.st-key-hdr button:hover{background:var(--g);color:#fff}
+.st-key-hdr div[data-baseweb="select"]>div{min-height:32px;font-size:11px}
+.hd{display:flex;align-items:center;gap:12px}
+.hd img{height:34px;width:auto;max-height:34px;object-fit:contain;flex:none}
+.hd .ic{font-size:26px}
+.hd b{display:block;color:var(--g);font-size:19px!important;font-weight:800;line-height:1.2}
+.hd small{display:block;color:#6b705f;font-size:11px!important;line-height:1.3}
+/* ---- tabs: one compact line, Contribute pinned to the far right corner ---- */
+.stTabs [data-baseweb="tab-list"]{display:flex;flex-wrap:nowrap;width:100%;gap:2px;border-bottom:2px solid var(--moss);overflow-x:auto;scrollbar-width:thin}
+.stTabs [data-baseweb="tab"]{flex:none;height:32px;padding:0 9px;border-radius:8px 8px 0 0;color:#5d6657;white-space:nowrap}
+.stTabs [data-baseweb="tab"] p{font-size:11.5px!important}
+.stTabs [data-baseweb="tab"]:hover{background:var(--sand2)}
+.stTabs [aria-selected="true"]{background:var(--g)}
+.stTabs [aria-selected="true"] p{color:#fff!important}
+.stTabs [data-baseweb="tab-highlight"],.stTabs [data-baseweb="tab-border"]{display:none}
+.stTabs [data-baseweb="tab-panel"]{background:var(--card);border:1px solid var(--line);border-top:0;border-radius:0 0 10px 10px;padding:12px 14px}
+.stTabs [role="tablist"],.stTabs [role="tablist"] :has(>[role="tab"]){display:flex;flex-wrap:nowrap;width:100%}
+.stTabs [role="tab"]:last-of-type{margin-left:auto!important;background:#7c3aed;box-shadow:0 2px 8px rgba(124,58,237,.4)}
+.stTabs [role="tab"]:last-of-type p{color:#fff!important;font-weight:700}
+.stTabs [role="tab"]:last-of-type[aria-selected="true"]{background:#4c1d95}
+/* ---- small buffer colour pickers, tight spacing ---- */
+[data-testid="stColorPickerBlock"]{width:20px!important;height:20px!important;border-radius:50%!important}
+[data-testid="stColorPicker"]{width:auto!important}
+.st-key-pk1 [data-testid="stHorizontalBlock"],.st-key-pk2 [data-testid="stHorizontalBlock"]{gap:.2rem!important;flex-wrap:nowrap!important}
+.st-key-pk1 [data-testid="stColumn"],.st-key-pk2 [data-testid="stColumn"]{flex:0 0 auto!important;width:auto!important;min-width:0!important}
+.stButton>button,.stDownloadButton>button{background:var(--g);color:#fff;border:0;border-radius:8px;font-size:12px!important;font-weight:600!important;transition:.15s}
+.stButton>button:hover,.stDownloadButton>button:hover{background:var(--g2);color:#fff;box-shadow:0 3px 8px rgba(47,93,70,.25)}
+.stButton>button[data-testid="stBaseButton-primary"],.stButton>button[kind="primary"]{background:var(--acc)}
+.stButton>button[data-testid="stBaseButton-primary"]:hover,.stButton>button[kind="primary"]:hover{background:var(--acc2);box-shadow:0 3px 8px rgba(183,121,31,.3)}
+.stButton>button:disabled,.stDownloadButton>button:disabled{background:#c9c4b0;color:#8d8a7a}
+div[data-baseweb="select"]>div,div[data-baseweb="input"],div[data-baseweb="base-input"]{background:#fff!important;border-color:var(--line)!important;border-radius:8px}
+[data-testid="stFileUploaderDropzone"]{background:#fff;border:1.5px dashed var(--moss);border-radius:10px}
+[data-testid="stVerticalBlockBorderWrapper"]{background:var(--card);border-color:var(--line)!important;border-radius:10px;box-shadow:0 1px 3px rgba(38,48,42,.08)}
+[data-testid="stProgress"]>div>div>div{background:var(--g)!important}
+[data-testid="stProgress"]>div>div{background:var(--sand2)!important}
+.lg{display:flex;align-items:center;gap:4px;margin:7px 0}
+.lg i{display:inline-block;width:22px;height:10px;box-sizing:border-box;flex:none}
+.custom-footer{text-align:center;color:#7a7d6c;font-size:10px;padding:6px 0;border-top:1px solid var(--line);margin-top:10px}
+.custom-footer a{color:var(--g);text-decoration:none}
+.sec{font-weight:700;font-size:14px!important;color:var(--g);border-left:4px solid var(--acc);padding-left:8px;margin:6px 0}
+@media(max-width:700px){.block-container{padding:.4rem .5rem!important}.hd small{display:none}.hd b{font-size:15px!important}
+  .stTabs [data-baseweb="tab-panel"]{padding:8px}}
 </style>""", unsafe_allow_html=True)
 
-LANDING = r"""
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500&display=swap" rel="stylesheet">
+with st.container(key="hdr"):
+    _h1, _h3, _h4 = st.columns([6.8, 1.7, 1.0], vertical_alignment="center")
+    hdr_slot = _h1.empty()
+    basemap = _h3.selectbox("Base map", list(BASEMAPS), index=2, label_visibility="collapsed", format_func=lambda k: "🗺️ " + k)
+    if _h4.button("🚪 Log out", width="stretch"):
+        st.session_state["auth"] = False
+        st.rerun()
+
+
+def load_vector(name, data):
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, os.path.basename(name))
+        with open(p, "wb") as fh:
+            fh.write(data)
+        if name.lower().endswith(".zip"):
+            with zipfile.ZipFile(p) as zf:
+                zf.extractall(d)
+            p = next((os.path.join(r, x) for r, _, fs in os.walk(d) for x in fs if x.lower().endswith(".shp")), None)
+            if not p:
+                return None
+        g = gpd.read_file(p)
+    return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
+
+
+@st.cache_resource(show_spinner="Loading...", max_entries=6)
+def layer_for(name, data, bm, labels, dash, cols):
+    g = load_vector(name, data)
+    if g is None:
+        raise ValueError("No .shp found inside the zip.")
+    l = make_layer(g, list(labels), list(bm), dash)
+    l["cols"], l["key"] = list(cols), f"{name}|{len(data)}|{bm}|{labels}|{dash}|{cols}"
+    return l
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def dem_web(wkb):
+    z, g, edges = terrain(wkb)[:3]
+    im, e = dem_rgba(z, g, edges)
+    buf = io.BytesIO()
+    im.save(buf, "PNG")
+    (lo0, la0), (lo1, la1) = unmerc(e[0], e[2]), unmerc(e[1], e[3])
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode(), [[la0, lo0], [la1, lo1]]
+
+
+@st.cache_resource(show_spinner=False, max_entries=2)
+def dem_tif_bytes(wkb):
+    z, g = terrain(wkb)[:2]
+    return geotiff_bytes(np.where(np.isnan(z), -9999, z).astype("float32"), g, -9999)
+
+
+@st.cache_resource(show_spinner=False)
+def _memo_store():
+    return {}
+
+
+def memo(key, fn):
+    s = _memo_store()
+    if key not in s:
+        if len(s) > 40:
+            s.clear()
+        s[key] = fn()
+    return s[key]
+
+
+def sticky(key, fn):
+    """Like memo, but a failed (None) result is retried on the next rerun."""
+    s = _memo_store()
+    if s.get(key) is None:
+        v = fn()
+        if v is None:
+            return None
+        s[key] = v
+    return s[key]
+
+
+def show_html(html, height):
+    if hasattr(st, "iframe"):
+        try:
+            st.iframe(html, height=height)
+            return
+        except Exception:
+            pass
+    components.html(html, height=height)
+
+
+def find_asset(assets, stem, ext):
+    return next((v for k, v in assets.items() if k.lower().endswith(ext) and stem_of(k) == norm(stem)), None)
+
+
+@st.cache_resource
+def job_store():
+    return {}
+
+
+@st.cache_resource
+def georef_store():
+    return {}
+
+
+JOBS, GEO = job_store(), georef_store()
+
+
+def first_bytes(assets, keys, local):
+    for k in keys:
+        try:
+            code, _, body = fetch_range(assets[k])
+            if code == 200 and body:
+                return body
+        except Exception:
+            pass
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in [os.path.join(here, local), local, "assets/" + local]:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return f.read()
+
+
+legend_image = lambda assets: first_bytes(
+    assets, [k for k in assets if "legend_toposheet" in k.lower() or "legend_topsheet" in k.lower()], "legend_toposheet.png")
+
+
+def logo_image(assets):
+    keys = [k for k in assets if k.lower().endswith(("logo.png", "logo.jpg", "logo.jpeg"))]
+
+    root = [k for k in keys if not assets[k].startswith("contributions/")]
+    contrib = sorted((k for k in keys if assets[k].startswith("contributions/")), reverse=True)
+    return first_bytes(assets, root + contrib, "logo.png")
+
+
+def read_osm_index(v):
+    a = release_assets()
+    if "OSM_SHEET_INDEX.shp" not in a:
+        raise FileNotFoundError("OSM_SHEET_INDEX.shp not found in the HF repo listing")
+    with tempfile.TemporaryDirectory() as d:
+        for ext in ("shp", "shx", "dbf", "prj", "cpg"):
+            if f"OSM_SHEET_INDEX.{ext}" in a:
+                with open(os.path.join(d, f"OSM_SHEET_INDEX.{ext}"), "wb") as f:
+                    f.write(fetch_range(a[f"OSM_SHEET_INDEX.{ext}"])[2])
+        os.environ["SHAPE_RESTORE_SHX"] = "YES"
+        g = gpd.read_file(os.path.join(d, "OSM_SHEET_INDEX.shp"))
+    return g.set_crs(4326) if g.crs is None else g.to_crs(4326)
+
+
+@st.cache_resource(show_spinner="Loading...", max_entries=1)
+def osm_geojson(v):
+    g = read_osm_index(v)
+    g["geometry"] = g.geometry.simplify(0.0005)
+    return json.loads(g.to_json(default=str))
+
+
+@st.cache_resource(show_spinner="Loading...", max_entries=1)
+def osm_sheet_table(v):
+    g = read_osm_index(v)
+    col = "OSM_SHEET_" if "OSM_SHEET_" in g.columns else next(c for c in g.columns if c != "geometry" and g[c].dtype == object)
+    out = {}
+    for nm, r in zip(g[col].astype(str), g.geometry.bounds.itertuples(index=False)):
+        out.setdefault(re.sub(r"\s+", "", nm).upper(), (float(r.minx), float(r.miny), float(r.maxx), float(r.maxy)))
+    return out
+
+
+def match_sheet(filename, table):
+    return next(((c.upper(), table[c.upper()]) for c in re.findall(r"[A-Za-z0-9]+", os.path.splitext(filename)[0])
+                 if c.upper() in table), None)
+
+
+def describe_exit(rc):
+    if rc < 0:
+        return f"killed by signal {-rc}" + (" (SIGKILL - usually out of memory)" if rc == -9 else "")
+    code = rc & 0xFFFFFFFF
+    known = {0xC0000005: "access violation (native crash)", 0xC0000017: "not enough memory", 0xC0000135: "DLL not found",
+             0xC00000FD: "stack overflow", 0xC0000409: "native stack buffer overrun",
+             0xC06D007F: "DLL function not found (library version conflict)"}
+    return f"{known[code]} [0x{code:08X}]" if code in known else f"exit code {rc}"
+
+
+def wtg_points(layers):
+    out = []
+    for l in layers:
+        for f in l["feats"]:
+            g = shape(f["geom"])
+            out += [(round(q.x, 6), round(q.y, 6), feat_name(f["props"], f"WTG {len(out) + 1}"))
+                    for q in getattr(g, "geoms", [g]) if q.geom_type == "Point"]
+    return tuple(out)
+
+
+# ---------------- background jobs ----------------
+def spawn(mode, d):
+    env = dict(os.environ, **({"HF_TOKEN": TOKEN} if TOKEN else {}), **({"R2_BASE": R2_BASE} if R2_BASE else {}))
+    with open(os.path.join(d, "log.txt"), "wb") as lg:
+        return subprocess.Popen([sys.executable, os.path.abspath(__file__), mode, d], env=env, stdout=lg,
+                                stderr=subprocess.STDOUT, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+
+
+def new_job(mode, d, msg, **extra):
+    return {"status": "running", "progress": 0.0, "msg": msg, "start": time.time(), "end": None, "error": None,
+            "dir": d, "proc": spawn(mode, d), **extra}
+
+
+def poll(job, ok_file, on_ok):
+    if not job or job["status"] != "running":
+        return
+    d = job["dir"]
+    try:
+        with open(os.path.join(d, "progress.json"), encoding="utf-8") as f:
+            p = json.load(f)
+        job["progress"], job["msg"] = p["progress"], p["msg"]
+    except Exception:
+        pass
+    rc = job["proc"].poll()
+    if rc is None:
+        return
+    job["end"] = time.time()
+    if rc == 0 and os.path.exists(os.path.join(d, ok_file)):
+        on_ok(job)
+        job.update(status="done", progress=1.0, msg="Done")
+    else:
+        try:
+            with open(os.path.join(d, "log.txt"), encoding="utf-8", errors="replace") as f:
+                tail = "".join(f.readlines()[-12:]).strip()
+        except Exception:
+            tail = ""
+        job.update(status="error", error=f"{describe_exit(rc)} | last step: {job.get('msg')}" + (f"\n{tail}" if tail else ""))
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def kill_job(job, status=None):
+    if not job:
+        return
+    try:
+        if job["status"] == "running":
+            job["proc"].terminate()
+            job["proc"].wait(timeout=5)
+    except Exception:
+        pass
+    if status:
+        job.update(status=status, end=time.time())
+    shutil.rmtree(job["dir"], ignore_errors=True)
+
+
+def start_export(sheets_pm, layers, title, sheets_str, dpi, legend_bytes, kind, extra):
+    d = tempfile.mkdtemp(prefix="topo_export_")
+    with open(os.path.join(d, "input.json"), "w", encoding="utf-8") as f:
+        json.dump({"sheets_pm": sheets_pm, "layers": [light(l) for l in layers], "title": title, "sheets_str": sheets_str,
+                   "dpi": dpi, "kind": kind, "base": extra.get("base"), "sig": dict(_S.sig),
+                   "bounds": [[k[0], k[1], list(v)] for k, v in _S.bounds.items()]}, f)
+    for name, data in (("legend.png", legend_bytes), ("logo.bin", extra.get("logo"))):
+        if data:
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(data)
+    if extra.get("dem"):
+        z, g, edges = extra["dem"]
+        np.savez_compressed(os.path.join(d, "dem.npz"), z=z, g=np.array(g), edges=np.array(edges))
+    for k in ("contours", "roads", "water"):
+        if extra.get(k):
+            with open(os.path.join(d, k + ".json"), "w", encoding="utf-8") as f:
+                json.dump(extra[k], f)
+    return new_job("--export", d, "Starting export process...", result=None, dpi=dpi, kind=kind)
+
+
+def _export_done(job):
+    with open(os.path.join(job["dir"], "result.png"), "rb") as f:
+        job["result"] = f.read()
+    try:
+        with open(os.path.join(job["dir"], "warn.txt")) as f:
+            job["warn"] = f.read()
+    except Exception:
+        pass
+    shutil.rmtree(job["dir"], ignore_errors=True)
+
+
+refresh_job = lambda job: poll(job, "result.png", _export_done)
+
+
+def start_georef(items, dpi):
+    d = tempfile.mkdtemp(prefix="topo_georef_")
+    for i, it in enumerate(items):
+        it["file"] = f"in_{i}{it.pop('ext', '.pdf')}"
+        with open(os.path.join(d, it["file"]), "wb") as f:
+            f.write(it.pop("data"))
+    with open(os.path.join(d, "input.json"), "w", encoding="utf-8") as f:
+        json.dump({"dpi": dpi, "items": items}, f)
+    return new_job("--georef", d, "Starting...", results=[], push=None, skipped=[])
+
+
+def _geo_done(job):
+    d = job["dir"]
+    with open(os.path.join(d, "results.json"), encoding="utf-8") as f:
+        job["results"] = json.load(f)
+    for x in os.listdir(d):
+        if x.startswith("in_") and x.endswith((".pdf", ".tif")):
+            os.remove(os.path.join(d, x))
+
+
+refresh_geo = lambda job: poll(job, "results.json", _geo_done)
+
+
+def write_token():
+    try:
+        return os.getenv("HF_WRITE_TOKEN") or st.secrets.get("HF_WRITE_TOKEN") or TOKEN
+    except Exception:
+        return TOKEN
+
+
+def hf_commit(pairs, wt, msg):
+    api = ensure("huggingface_hub", "huggingface_hub hf_xet").HfApi(token=wt)
+    for local, dest in pairs:
+        for attempt in range(3):
+            try:
+                api.upload_file(path_or_fileobj=local, path_in_repo=dest, repo_id=HF_REPO, repo_type="dataset",
+                                commit_message=f"{msg}: {os.path.basename(dest)}")
+                break
+            except Exception:
+                if attempt == 2:
+                    raise
+                time.sleep(3 * (attempt + 1))
+
+
+def publish_static(gid, j):
+    d = os.path.join(STATIC_GEO, gid)
+    os.makedirs(d, exist_ok=True)
+    for r in j["results"]:
+        src, dst = os.path.join(j["dir"], r["name"] + ".pmtiles"), os.path.join(d, r["name"] + ".png")
+        if "error" not in r and os.path.isfile(src) and not os.path.exists(dst):
+            try:
+                os.link(src, dst)
+            except OSError:
+                shutil.copyfile(src, dst)
+
+
+def drop_static(gid):
+    if gid:
+        shutil.rmtree(os.path.join(STATIC_GEO, gid), ignore_errors=True)
+
+
+def push_bg(job, pairs, wt):
+    job["push"] = {"status": "running"}
+
+    def run():
+        try:
+            hf_commit(pairs, wt, "Georeferenced toposheet")
+            job["push"] = {"status": "done", "paths": [d for _, d in pairs]}
+        except Exception as e:
+            job["push"] = {"status": "error", "msg": str(e)}
+    threading.Thread(target=run, daemon=True).start()
+
+
+def hf_upload(files, wt):
+    ts, pairs, tmps = int(time.time()), [], []
+    for f in files:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".upload") as t:
+            t.write(f.getbuffer())
+        tmps.append(t.name)
+        pairs.append((t.name, f"contributions/{ts}_{re.sub(r'[^\w.-]', '_', f.name)}"))
+    try:
+        hf_commit(pairs, wt, "Contribution")
+    finally:
+        for t in tmps:
+            try:
+                os.remove(t)
+            except OSError:
+                pass
+    return [d for _, d in pairs]
+
+
+# ---------------- data + header ----------------
+assets = {}
+try:
+    assets = release_assets()
+except Exception as e:
+    st.error(f"Hugging Face error: {e}")
+st.session_state["hf_sig"] = hash(tuple(sorted(_S.sig.items())))
+
+
+@st.fragment(run_every=WATCH_EVERY)
+def watch_hf():
+    try:
+        release_assets()
+    except Exception:
+        return
+    if hash(tuple(sorted(_S.sig.items()))) != st.session_state.get("hf_sig"):
+        st.rerun()
+
+
+watch_hf()
+pm_assets = {n: i for n, i in assets.items() if n.lower().endswith(".pmtiles") and not is_vec(n)}
+# whole topo: the SOI-OSM-50k parts are always loaded (no sheet selector); falls back to every .pmtiles if none are present
+chosen = [n for n in pm_assets if "soiosm" in stem_of(n)] or list(pm_assets)
+
+_ver = lambda *keys: tuple(sorted((k, _S.sig.get(p)) for k, p in assets.items() if any(w in k.lower() for w in keys)))
+leg_bytes = sticky(("legend", _ver("legend_t")), lambda: legend_image(assets))
+logo_bytes = sticky(("logo", _ver("logo")), lambda: logo_image(assets))
+hdr_slot.markdown(
+    '<div class="hd">' + (f'<img src="data:image/jpeg;base64,{base64.b64encode(logo_bytes).decode()}">' if logo_bytes
+                          else '<span class="ic">🛰️</span>') +
+    f'<div><b>{APP_TITLE}</b><small>Site boundaries &amp; buffer zones &middot; Toposheets &middot; DEM &amp; contours &middot; '
+    'Roads &middot; Surface water &middot; Villages &middot; Satellite &middot; Vantage points</small></div></div>', unsafe_allow_html=True)
+
+project_title = st.text_input(
+    "Project Title",
+    value="Preliminary Assessment Study for the 14MW Solar Project at Gadgi, Bidar District, Karnataka, India")
+
+for _gid, _gj in list(GEO.items()):
+    if _gj["status"] != "running" and _gj.get("end") and time.time() - _gj["end"] > GEO_TTL:
+        kill_job(_gj)
+        drop_static(_gid)
+        GEO.pop(_gid, None)
+gjob = GEO.get(st.session_state.get("geo_id"))
+refresh_geo(gjob)
+geo_busy = bool(gjob) and (gjob["status"] == "running" or (gjob.get("push") or {}).get("status") == "running")
+
+# ---------------- controls ----------------
+T = st.tabs(["📍 Site vectors", "🧭 Georeferencing", "🗾 Toposheet viewer", "💧 Drainage", "⛰️ DEM & Contour",
+             "🛣️ Roads & Transportation", "🛰️ Satellite map", "🏘️ Bhuvan Village Boundary", "🎯 Vantage-Point Selection",
+             "🤝 Contribute"])
+notes = st.container()
+st.markdown('<div class="sec">Live map</div>', unsafe_allow_html=True)
+
+with T[1]:
+    c1, c2 = st.columns([1.4, 1])
+    show_osm_index = c2.toggle("📐 Show OSM Sheet Index on the map", value=False)
+    c2.caption("Hover a sheet on the map to see its name. A PDF file name must contain its sheet name.")
+    with c1:
+        geo_files = st.file_uploader("Toposheet PDF(s) or GeoTIFF(s)", type=["pdf", "tif", "tiff"], accept_multiple_files=True,
+                                     key="geo_pdfs", disabled=geo_busy)
+        if st.button("▶️ Start Georeferencing", type="primary", width="stretch", disabled=geo_busy or not geo_files, key="geo_start"):
+            try:
+                tbl = osm_sheet_table(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
+            except Exception as e:
+                tbl = {}
+                st.error(f"Sheet index: {e}")
+            items, bad, have, seen = [], [], [], set()
+            for f in geo_files:
+                is_tif = f.name.lower().endswith((".tif", ".tiff"))
+                hit = None if is_tif else match_sheet(f.name, tbl)
+                stem = re.sub(r"[^\w.-]", "_", os.path.splitext(f.name)[0])
+                if not (hit or is_tif):
+                    bad.append(f.name)
+                elif stem + ".pmtiles" in pm_assets or stem in seen:
+                    have.append(stem + ".pmtiles")
+                else:
+                    seen.add(stem)
+                    items.append({"name": stem, "bounds": list(hit[1]) if hit else None, "data": f.getvalue(),
+                                  "ext": ".tif" if is_tif else ".pdf"})
+            if items:
+                _old = st.session_state.get("geo_id")
+                kill_job(GEO.pop(_old, None))
+                drop_static(_old)
+                gid = uuid.uuid4().hex
+                GEO[gid] = start_georef(items, GEO_DPI)
+                GEO[gid]["skipped"] = bad
+                st.session_state["geo_id"], st.session_state["geo_poll"] = gid, True
+                st.rerun()
+            elif bad:
+                st.error("No PDF name matches a sheet: " + ", ".join(bad))
+            elif have:
+                st.info("Already in the library: " + ", ".join(have))
+
+with T[2]:
+    show_topo = st.toggle("🗾 Show topo layer on the map", value=False)
+    st.caption("The whole India SOI OSM 50k")
+
+with T[3]:
+    show_dr = {k: col.toggle(f"💧 {v[0]}", value=False) for col, (k, v) in zip(st.columns(4), DRAIN.items())}
+    st.caption("Drainage layers from the Bhuvan LULC database, clipped to the outermost buffer. Needs a site vector + buffer.")
+
+with T[4]:
+    c = st.columns(2)
+    show_dem = c[0].toggle("⛰️ Show DEM (Elevation)", value=False)
+    show_con = c[1].toggle(f"〰️ Show Contours ({CONTOUR_STEP} m, lines ≥ {CONTOUR_MIN_LEN} m long)", value=False)
+    st.caption("NASA SRTM 30 m elevation, clipped to the outermost buffer. Needs a site vector + buffer.")
+
+with T[5]:
+    show_roads = st.toggle("🛣️ Show Roads & Transportation", value=False)
+    st.caption("Survey of India roads, clipped to the outermost buffer. Needs a site vector + buffer.")
+
+with T[6]:
+    st.markdown("**Satellite map**: Google Satellite imagery inside the outermost buffer, white outside, with the site and buffers on top.")
+    st.caption("Choose *Satellite Map* under Export Map once a site vector is loaded. For the live map use the Base map selector in the header.")
+
+with T[7]:
+    show_vil = st.toggle("🏘️ Show Bhuvan Village Boundary", value=False)
+    st.caption("Only villages intersecting the outermost buffer are shown. Viewer only (not in the map export). "
+               "Hover a village for its attributes. Needs a site vector + buffer.")
+    vil_dl = st.empty()
+
+layers, sig = [], []
+VEC_TYPES = ["geojson", "kml", "gpx", "zip"]
+with T[0]:
+    c_v1, c_v2 = st.columns(2)
+    # ---- Vector 1: project site + buffers (up to 5 colours) ----
+    with c_v1:
+        vf = st.file_uploader("Vector 1 (.geojson, .kml, .zip)", type=VEC_TYPES, key="vec1")
+        tb, pkc = st.columns([4, 2.6], vertical_alignment="bottom")
+        bt = tb.text_input("Vector 1 buffers (e.g. 2km, 5km, 10km, 20km)", "2km, 5km, 10km", key="buf1")
+        with pkc, st.container(key="pk1"):
+            cols_ = [p.color_picker("c", COLORS[k], key=f"bc1{k}", label_visibility="collapsed", help=f"Buffer {k + 1} colour")
+                     for k, p in enumerate(st.columns(5))]
+        bm = parse_buffers(bt)
+        dl = default_labels(1, bm)
+        lt = st.text_input("Vector 1 legend text (comma separated: site, then each buffer)", ", ".join(dl), key=f"lab1_{bt}")
+        lab = [x.strip() for x in lt.split(",")]
+        labels = [lab[k] if k < len(lab) and lab[k] else d for k, d in enumerate(dl)]
+        if vf:
+            try:
+                layers.append(layer_for(vf.name, vf.getvalue(), tuple(bm), tuple(labels), False, tuple(cols_)))
+                sig.append(vf.name)
+            except Exception as e:
+                st.error(f"Vector 1 error: {e}")
+    # ---- Vector 2: any number of files (transmission lines etc.), no buffers, own legend text + colour ----
+    with c_v2:
+        v2fs = st.file_uploader("Vector 2 - transmission line / other files (one or more)", type=VEC_TYPES,
+                                accept_multiple_files=True, key="vec2")
+        for n, f in enumerate(v2fs or []):
+            dflt = "Transmission Line" if len(v2fs) == 1 else os.path.splitext(f.name)[0]
+            tcol, pcol = st.columns([6, 1], vertical_alignment="bottom")
+            nm = tcol.text_input(f"Legend text - {f.name}", dflt, key=f"v2lab{n}_{f.name}_{dflt}").strip() or dflt
+            colr = pcol.color_picker("c", V2_COLS[n % len(V2_COLS)], key=f"v2c{n}_{f.name}", label_visibility="collapsed",
+                                     help="Line colour")
+            try:
+                l = layer_for(f.name, f.getvalue(), (), (nm,), n > 0, tuple(COLORS))   # first file solid, the rest dashed
+                layers.append(dict(l, scol=colr, v2=True, key=f"{l['key']}|{colr}"))
+                sig.append(f.name)
+            except Exception as e:
+                st.error(f"{f.name}: {e}")
+
+# ---- vantage-point selection for the WTGs (point features of Vector 1 / 2) ----
+wtg, vs_res, vs_on, vs_args = wtg_points(layers), None, [], None
+with T[8]:
+    v1, v2, v3 = st.columns(3)
+    vs_h = v1.number_input("Observer height (m)", 0.0, 100.0, 1.6, 0.1)
+    vs_t = v2.number_input("Target height (m)", 0.0, 300.0, 0.0, 1.0)
+    vs_d = v3.number_input("Search radius = buffer around each WTG (m)", 100.0, 10000.0, 2000.0, 100.0)
+    st.caption("Vantage points for the point features (WTGs) of Vector 1 / 2 on SRTM 30 m terrain. The map and table show Batch 1; "
+               "all 3 batches (KML + GeoTIFF) are in Deliverables below the map. Click a vantage point to see which WTGs it covers.")
+    if st.button("▶️ Run vantage-point selection", type="primary", width="stretch"):
+        if wtg:
+            st.session_state["vs_args"] = (wtg, vs_h, vs_t, vs_d)
+        else:
+            st.warning("Upload a point vector (WTG locations) in the Site vectors tab first.")
+    vs_args = st.session_state.get("vs_args")
+    if vs_args:
+        try:
+            vs_res = vs_data(*vs_args)
+        except Exception as e:
+            st.error(f"Vantage-point error: {e}")
+        if vs_res:
+            if vs_args[0] != wtg:
+                st.info("The point vectors changed since this run - run the analysis again to update.")
+            tot, b_ = len(vs_args[0]), vs_res["batches"][0]   # only Batch 1 is shown
+            st.caption(f"**Batch 1:** {len(b_['pts'])} vantage points cover {tot - b_['left']} of {tot} WTGs"
+                       + (f" - not covered: {b_['missed']}" if b_["missed"] else ""))
+            st.dataframe([{"Vantage": f"Vantage {k}", "Lon": round(q["lon"], 5), "Lat": round(q["lat"], 5),
+                           "Elev (m)": round(q["elev_m"]), "WTGs": q["wtg_count"], "WTGs covered": q["wtg_names"]}
+                          for k, q in enumerate(b_["pts"], 1)], hide_index=True, width="stretch")
+            vs_on = [st.toggle("👁️ Visibility raster - Batch 1", key="vson1")]
+            st.caption("Visibility raster: the darker the colour, the more WTGs are visible from that cell.")
+vs_b = vs_res["batches"][:1] if vs_res else []   # map / legend / table: Batch 1 only (Deliverables export all batches)
+
+with T[9]:
+    cfs = st.file_uploader("Any file: toposheet, GeoTIFF, vector, PNG, PDF, ...", accept_multiple_files=True, key="contrib")
+    if cfs and st.button("Submit contribution"):
+        wt = write_token()
+        if not wt:
+            st.error("No write token: set HF_WRITE_TOKEN (env or Streamlit secret).")
+        else:
+            try:
+                with st.spinner("Uploading (large files can take a few minutes)..."):
+                    up = hf_upload(cfs, wt)
+                release_assets.clear()
+                st.success("Uploaded to contributions/: " + ", ".join(os.path.basename(p) for p in up))
+            except Exception as e:
+                st.error(f"Upload failed: {e}")
+
+osm_json = None
+if show_osm_index:
+    try:
+        osm_json = osm_geojson(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
+    except Exception as e:
+        notes.error(f"OSM index: {e}")
+
+outer = [shape(f["geometry"]) for l in layers for f in (l["bufs"][-1]["gj"] if l["bufs"] else l["site"])["features"]]
+sheets_str = "-"   # topo sheet numbers: OSM-index sheets touching the outermost buffer (only once a vector is loaded)
+if outer:
+    try:
+        _tbl = osm_sheet_table(_S.sig.get(assets.get("OSM_SHEET_INDEX.shp")))
+        _u = unary_union(outer)
+        sheets_str = ", ".join(fmt_sheet(k) for k, b in sorted(_tbl.items()) if _u.intersects(box(*b))) or "-"
+    except Exception as e:
+        notes.error(f"Sheet index: {e}")
+
+ou_wkb = shapely.force_2d(unary_union(outer)).wkb if outer else None
+okey = f"{zlib.crc32(ou_wkb)}:{len(ou_wkb)}" if ou_wkb else ""
+terr = road_fc = dem_ov = None
+water, rv, wv = {}, None, {}
+if not ou_wkb and (show_roads or show_dem or show_con or show_vil or any(show_dr.values())):
+    notes.warning("Roads / water / villages / DEM / contours need a vector (Vector 1 or 2) with a buffer. Upload one first.")
+if ou_wkb and (show_dem or show_con):
+    try:
+        terr = terrain(ou_wkb)
+        dem_ov = dem_web(ou_wkb) if show_dem else None
+        if show_con and not terr[3]["features"]:
+            notes.warning(f"No contour lines of {CONTOUR_MIN_LEN} m or longer inside the buffer.")
+    except Exception as e:
+        notes.error(f"DEM error: {e}")
+if ou_wkb and show_roads:
+    rk = next((v for k, v in assets.items() if k.lower().endswith(".pmtiles") and stem_of(k).startswith("roads")), None)
+    try:
+        if not rk:
+            raise FileNotFoundError("roads.pmtiles not found in the HF repo listing")
+        rv = _S.sig.get(rk)
+        road_fc = road_data(rk, ou_wkb, rv)
+        if not road_fc:
+            notes.warning("No roads inside the buffer.")
+    except Exception as e:
+        notes.error(f"Roads error: {e}")
+if ou_wkb:
+    for k, (lab, stem, _) in DRAIN.items():
+        if not show_dr[k]:
+            continue
+        try:
+            wk = find_asset(assets, stem, ".pmtiles")
+            if not wk:
+                raise FileNotFoundError(f"{stem}.pmtiles not found in the HF repo listing")
+            wv[k] = _S.sig.get(wk)
+            fc = water_data(wk, ou_wkb, wv[k])
+            if fc:
+                water[k] = fc
+            else:
+                notes.warning(f"No {lab} inside the buffer.")
+        except Exception as e:
+            notes.error(f"{lab} error: {e}")
+vil_fc = vv = None
+if ou_wkb and show_vil:
+    try:
+        vk = find_asset(assets, "bhuvan_villages", ".pmtiles")
+        if not vk:
+            raise FileNotFoundError("bhuvan_villages.pmtiles not found in the HF repo listing")
+        vv = _S.sig.get(vk)
+        vil_fc = village_data(vk, ou_wkb, vv)
+        if not vil_fc:
+            notes.warning("No villages inside the buffer.")
+    except Exception as e:
+        notes.error(f"Villages error: {e}")
+if vil_fc:
+    vil_dl.download_button(
+        f"⬇️ Intersecting villages ({len(vil_fc['features'])}) - KML",
+        memo(("vil2", okey, vv), lambda: villages_kml([
+            (next((str(v) for k, v in f["properties"].items() if k.lower() == "v_name" and v), "Village"),
+             shape(f["geometry"]), f["properties"]) for f in vil_fc["features"]])),
+        "bhuvan_villages_intersecting.kml", KML, width="stretch", key="vil_dl")
+on_dem, on_con, on_rd, on_wt = bool(dem_ov), bool(show_con and terr and terr[3]["features"]), bool(road_fc), bool(water)
+
+pmc = lambda n: {"name": n, "v": zlib.crc32(str(_S.sig.get(pm_assets[n])).encode()),
+                 "r2": f"{R2_BASE}/{quote(n)}" if R2_BASE else None,
+                 "alt": f"{HF_BASE}/resolve/main/{quote(pm_assets[n])}"}
+warm = [{"r2": p["r2"], "v": p["v"]} for p in map(pmc, pm_assets)] if R2_BASE else []
+
+geo_ov = [r for r in (gjob["results"] if gjob and gjob["status"] == "done" else [])
+          if "error" not in r and r["name"] + ".pmtiles" not in pm_assets]
+
+
+def preview_url(job, name):
+    def rd():
+        with open(os.path.join(job["dir"], name + ".jpg"), "rb") as f:
+            return "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+    return memo(("geoprev", st.session_state["geo_id"], name), rd)
+
+
+geo_local = [os.path.join(gjob["dir"], r["name"] + ".pmtiles") for r in geo_ov]
+if geo_ov:
+    publish_static(st.session_state["geo_id"], gjob)
+
+geo_img = [{"name": r["name"], "v": zlib.crc32(st.session_state["geo_id"].encode()), "b": r["pb"],
+            "alt": f"/app/static/geo/{st.session_state['geo_id']}/{r['name']}.png",
+            "url": preview_url(gjob, r["name"])} for r in geo_ov] if show_topo else []
+
+vp = [{"color": VS_COL[i % 3], "pts": [[q["lat"], q["lon"], f"Batch {i + 1} - Vantage {k}", q["wtg_names"], round(q["elev_m"]), q["wtg_count"]]
+                                       for k, q in enumerate(b["pts"], 1)]}
+      for i, b in enumerate(vs_b)] if vs_res else []
+vr = [dict(zip(("url", "b"), memo(("vr2", hash(vs_args), n), lambda b=b: cov_png(b["cov"], vs_res["g"], VS_RAS))))
+      for n, (b, on) in enumerate(zip(vs_b, vs_on), 1) if on] if vs_res else []
+vbuf = memo(("vbuf", hash(vs_args)), lambda: wtg_buffer(vs_args[0], vs_args[3])) if vs_res else None
+
+cfg = {
+    "basemap": basemap, "base": BASEMAPS[basemap], "colors": COLORS, "layers": [dict(light(l), fc=site_fc(l)) for l in layers],
+    "sig": "|".join(sig + [g["name"] for g in geo_ov]),
+    "pm": [pmc(n) for n in chosen] if show_topo else [], "geo_img": geo_img,
+    "all": warm, "wv": str(zlib.crc32(json.dumps(warm).encode())),
+    "osm_index": osm_json, "georef": [r["pb"] for r in geo_ov], "vp": vp,
+    "dem": {"url": dem_ov[0], "b": dem_ov[1]} if on_dem else None,
+    "contours": terr[3] if on_con else None, "con_labels": terr[5] if on_con else None,
+    "vil": vil_fc, "roads": road_fc, "water": water or None, "wcol": {k: v[2] for k, v in DRAIN.items()},
+        "cc": CON_COL, "rc": ROAD_COL, "vbc": VS_BUF_COL, "sw": SITE_W, "vc": VIL_COL,
+}
+if vp:
+    cfg["sig"] += "|vs"
+    cfg.update(vr=vr, vbuf=vbuf, wtg=[[q[1], q[0], q[2]] for q in vs_args[0]])
+
+
+# ---------------- Page ----------------
+HTML = """
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/pmtiles@3.0.7/dist/pmtiles.js"></script>
 <style>
-:root{--n:#0A2342;--b:#1D5FD1;--t:#0FB5A6;--l:#DCE8F7;--m:#6B84A3}
-*{box-sizing:border-box}body{margin:0;font-family:Inter,sans-serif;color:var(--n);background:transparent}
-.w{max-width:1400px;margin:auto;padding:2px 2px 16px}
-.card{background:#fff;border:1px solid var(--l);border-radius:14px;box-shadow:0 4px 14px rgba(47,128,237,.08)}
-.badge{display:inline-block;background:#fff;border:1px solid #D0DCEE;border-radius:99px;padding:4px 11px;font:600 9.5px 'JetBrains Mono';color:#0F3A7D;letter-spacing:.5px}
-.badge i{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--t);margin-right:6px;animation:p 1.6s infinite}
-@keyframes p{50%{opacity:.25}}
-h1{font-size:27px;line-height:1.15;margin:10px 0;letter-spacing:-.5px;font-weight:800}
-h2{font-size:18px;margin:0 0 3px;font-weight:800}.eyebrow{font:600 9.5px 'JetBrains Mono';color:var(--b);text-transform:uppercase;letter-spacing:1px}
-p{color:#4A5F7A;line-height:1.55;font-size:12px;margin:5px 0}
-.hero{display:grid;grid-template-columns:1.05fr 1fr;gap:22px;align-items:center;padding:22px 26px;border-radius:18px;color:#fff;
- background:linear-gradient(120deg,#071B3A,#0F3A7D 60%,#1D5FD1);position:relative;overflow:hidden}
-.hero h1{color:#fff}.hero h1 span{background:linear-gradient(90deg,#7DB8F5,#5EEAD4);-webkit-background-clip:text;color:transparent}.hero p{color:#CFE0FA;font-size:12.5px}
-.hero .badge{background:rgba(255,255,255,.1);border-color:rgba(255,255,255,.25);color:#DCE9FF}
-.chips{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
-.chip{background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.2);border-radius:10px;padding:8px}
-.chip b{display:block;font-size:14px;color:#fff}.chip span{font-size:9.5px;color:#A9C4EE}
-.mini{background:#fff;color:var(--n);padding:12px;border-radius:14px}.mini h4{margin:0;font-size:12px}
-.sec{margin-top:26px}.tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
-.tab{border:1px solid #C9D8EE;background:#fff;color:var(--n);border-radius:9px;padding:5px 11px;font:600 10.5px Inter;cursor:pointer;transition:.2s}
-.tab:hover{border-color:var(--b)}.tab.on{background:var(--n);color:#fff;border-color:var(--n)}
-.g2{display:grid;grid-template-columns:1fr 1fr;gap:12px}.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
-.cmp{padding:13px}.cmp .h{display:flex;justify-content:space-between;font-size:11px;font-weight:700;margin-bottom:8px}.cmp .h em{font:500 9.5px 'JetBrains Mono';color:var(--t);font-style:normal}
-.cmp .s{display:grid;grid-template-columns:1fr 1fr;gap:8px}.cmp .s div{border-radius:10px;padding:8px;font-size:11px;line-height:1.5}
-.bad{background:#FDECEC;border:1px solid #F8D0D0}.ok{background:#E6F1FF;border:1px solid #BFD7F7}.s b{display:block;font-size:9px;letter-spacing:.8px;text-transform:uppercase;margin-bottom:3px}
-.bad b{color:#C53030}.ok b{color:var(--b)}
-.pil{padding:14px;transition:.25s}.pil:hover{transform:translateY(-4px);box-shadow:0 12px 24px rgba(29,95,209,.18)}
-.pil .ic{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:18px;margin-bottom:8px;color:#fff}
-.pil small{font:600 9.5px 'JetBrains Mono';color:var(--b)}.pil h3{margin:3px 0;font-size:13px}.pil p{font-size:11.5px}
-.pipe{padding:18px;background:linear-gradient(135deg,#EEF5FF,#fff 60%,#E4F8F5)}
-.steps{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0}
-.st{position:relative;overflow:hidden;text-align:left;background:#fff;border:1px solid #C9D8EE;border-radius:12px;padding:10px;cursor:pointer;font-family:Inter;transition:.2s}
-.st b{display:block;font-size:12.5px;color:var(--n)}.st span{font:600 9.5px 'JetBrains Mono';color:var(--m)}
-.st.on{border-color:var(--b);box-shadow:0 6px 16px rgba(29,95,209,.2)}.st.on span{color:var(--b)}
-.st .bar{position:absolute;left:0;bottom:0;height:3px;width:0;background:linear-gradient(90deg,var(--b),var(--t))}.st.on .bar{animation:f 7s linear forwards}
-@keyframes f{to{width:100%}}
-.det{display:grid;grid-template-columns:1.2fr 1fr;gap:18px;background:#fff;border:1px solid var(--l);border-radius:12px;padding:16px;min-height:200px}
-.tag{display:inline-block;background:#EDF1F7;border-radius:7px;padding:3px 9px;font-size:10.5px;font-weight:600;margin:4px 5px 0 0}
-pre{margin:0;background:#0A2342;color:#CFE0FA;border-radius:10px;padding:12px;font:500 10.5px/1.6 'JetBrains Mono';overflow:auto}
-.cta{margin-top:26px;text-align:center;padding:20px;border-radius:14px;background:linear-gradient(90deg,#0A2342,#1D5FD1);color:#fff;cursor:pointer;transition:.2s}
-.cta:hover{filter:brightness(1.12);transform:translateY(-2px)}
-.cta h3{margin:0 0 4px;font-size:16px}.cta p{color:#CFE0FA;margin:0;font-size:12px}
-.cta button{margin-top:10px;background:#fff;color:var(--n);border:none;border-radius:9px;padding:7px 16px;font:700 11.5px Inter;cursor:pointer}
-@media(max-width:900px){.hero,.det,.g2{grid-template-columns:1fr}.g4,.steps,.chips{grid-template-columns:1fr 1fr}}
+html,body{margin:0}
+.cl{display:block;width:30px;text-align:center;font:bold 10px Arial,sans-serif;color:#000;
+    text-shadow:-1px -1px 0 #fff,1px -1px 0 #fff,-1px 1px 0 #fff,1px 1px 0 #fff;pointer-events:none}
+.vsr{image-rendering:pixelated}
 </style>
-<div class="w">
-<div class="hero">
- <div><span class="badge"><i></i>AUDIT-GRADE RICE dMRV • VM0051 &amp; DREAM READY</span>
-  <h1>Turn Paddy Water Cycles into <span>Bankable, Audit-Proof</span> Carbon Credits.</h1>
-  <p>Compare farmer-reported aeration with Sentinel-1 radar and CHIRPS rainfall, plot by plot. Cloud-penetrating SAR, buffer gating and a flowering lock replace paper trails and manual spot checks.</p>
-  <div class="chips"><div class="chip"><b>6–12 d</b><span>Sentinel-1 revisit</span></div><div class="chip"><b>−10 m</b><span>Edge-buffer gate</span></div>
-  <div class="chip"><b>≥ 3 days</b><span>Creditable dry spell</span></div><div class="chip"><b>CHIRPS V3</b><span>Rain gap-fill</span></div></div></div>
- <div class="mini"><h4>🛰 Try it: drying trigger = dB_wet + Δ</h4>
-  <svg id="ch" viewBox="0 0 330 150" style="width:100%"></svg>
-  <div style="display:flex;align-items:center;gap:10px;font-size:11px"><span>Δ</span><input id="dl" type="range" min="0.5" max="8" step="0.5" value="3" style="flex:1"><b id="dv">3.0 dB</b></div>
-  <div id="hit" style="font-size:11px;color:var(--m);margin-top:4px"></div></div>
-</div>
-
-<div class="sec"><div class="eyebrow">Eliminate audit discounts</div><h2>Why Manual AWD Programmes Fail Verification</h2>
- <p>Disconnected spreadsheets, recycled photos and missing drainage logs force verifiers to haircut credit issuance.</p>
- <div class="tabs" id="ft"></div><div class="g2" id="cg"></div></div>
-
-<div class="sec"><div class="eyebrow">Enterprise architecture</div><h2>Built for Smallholder Scale and VVB Scrutiny</h2>
- <p>Each module of this workspace is designed to be defensible in front of an auditor.</p><div class="g4" id="pl" style="margin-top:12px"></div></div>
-
-<div class="sec"><div class="card pipe"><div class="eyebrow">End-to-end operational flow</div><h2>The 4-Stage Digital Pipeline</h2>
- <p>Click a stage, or let it play. Each stage shows what the engine does and a sample output.</p>
- <div class="steps" id="sp"></div><div class="det"><div><span class="badge" id="pb"></span><h3 id="pt" style="font-size:16px;margin:8px 0 4px"></h3><p id="pd"></p><div id="pg"></div></div>
- <div><div style="font:600 10px 'JetBrains Mono';color:var(--m);margin-bottom:6px" id="ph"></div><pre id="pc"></pre></div></div></div></div>
-
-<div class="cta" onclick="openPanel()"><h3>⬅ Ready when you are</h3><p>Open the side panel, sign in, upload your plots, set the parameters, and press ▶ Run analysis.</p><button onclick="openPanel();event.stopPropagation()">Open side panel</button></div>
-</div>
+<div id="m" style="height:480px;border:2px solid #d3ccb6;border-radius:10px;background:#fff"></div>
 <script>
-const $=i=>document.getElementById(i);
-const V=[-18.5,-19.8,-20.2,-19,-15.5,-13.8,-14.9,-19.5,-20,-16.2,-12.9,-18.8],wet=Math.min(...V),X=i=>18+i*28.5,Y=v=>10+(-8-v)/14*125;
-function draw(){const d=+$('dl').value,tr=wet+d;$('dv').textContent=d.toFixed(1)+' dB';let n=0;
- let s=`<line x1="14" x2="326" y1="${Y(wet)}" y2="${Y(wet)}" stroke="#1D5FD1" stroke-dasharray="4 3"/><text x="16" y="${Y(wet)-4}" font-size="9" fill="#1D5FD1">dB_wet ${wet}</text>
- <line x1="14" x2="326" y1="${Y(tr)}" y2="${Y(tr)}" stroke="#E5484D" stroke-dasharray="4 3"/><text x="318" text-anchor="end" y="${Y(tr)-4}" font-size="9" fill="#E5484D">trigger ${tr.toFixed(1)}</text>
- <polyline fill="none" stroke="#0FB5A6" stroke-width="2.4" points="${V.map((v,i)=>X(i)+','+Y(v)).join(' ')}"/>`;
- V.forEach((v,i)=>{const h=v>=tr;n+=h;s+=`<circle cx="${X(i)}" cy="${Y(v)}" r="${h?5.5:3.5}" fill="${h?'#E5484D':'#0FB5A6'}" stroke="#fff" stroke-width="1.5"/>`});
- $('ch').innerHTML=s;$('hit').textContent=`${n} of ${V.length} passes flagged as drying. Raise Δ and fewer passes qualify.`}
-$('dl').oninput=draw;draw();
-const C=[['registry','01 · Farmer & plot registry','Buffer + clusters','Handwritten rosters double-count neighbouring plots and overlapping claims.','<b>Spatial gate:</b> every plot is shrunk by an edge buffer; small plots are merged into Cluster Polygons (DREAM A 2.3.3b).'],
-['evidence','02 · Water-level evidence','Ground truth','Late manual logs and recycled gallery photos that fail audit scrutiny.','<b>Accuracy check:</b> tube observations are scored against satellite status; below 80% raises the deduction to 20%.'],
-['sar','03 · Monsoon cloud cover','Sentinel-1 SAR','Optical satellites go blind in Kharif, exactly when methane peaks.','<b>All-weather C-band radar:</b> VV/VH backscatter shows flooded vs dry soil through the clouds.'],
-['yield','04 · Flowering & rain risk','Lock + CHIRPS','Drying during flowering hurts yield, and rain between passes goes unnoticed.','<b>Flowering lock</b> keeps the window flooded; <b>CHIRPS rain</b> fills the gaps between satellite passes.']];
-const F=[['all','All 4 guardrails'],...C.map(c=>[c[0],c[1].slice(5)])];
-function filt(k){$('ft').innerHTML=F.map(f=>`<button class="tab ${f[0]==k?'on':''}" onclick="filt('${f[0]}')">${f[1]}</button>`).join('');
- $('cg').innerHTML=C.filter(c=>k=='all'||c[0]==k).map(c=>`<div class="card cmp"><div class="h"><span>${c[1]}</span><em>${c[2]}</em></div><div class="s"><div class="bad"><b>Legacy paper MRV</b>${c[3]}</div><div class="ok"><b>AWD dMRV</b>${c[4]}</div></div></div>`).join('');fit()}
-$('pl').innerHTML=[['🗺','#1D5FD1','01 · SPATIAL AUDIT','Buffer gate &amp; clusters','Plots without a core pixel are merged into cluster polygons, then mapped over satellite imagery.'],
-['🛰','#0FB5A6','02 · SAR &amp; LOCK','dB_wet and flowering lock','Flooded baseline, drying trigger and a lock window around heading, from Sentinel-1.'],
-['🌧','#0F3A7D','03 · CH₄ &amp; EXPORT','Rain-aware credit maths','Gap-filling, the 3-day rule and CHIRPS rainfall turn dry days into tCO₂e, with CSV export.'],
-['🧪','#0A2342','04 · GROUND TRUTH','Accuracy against the field','Confusion matrix of tube vs satellite, with the uncertainty deduction set automatically.']]
-.map(p=>`<div class="card pil"><div class="ic" style="background:${p[1]}">${p[0]}</div><small>${p[2]}</small><h3>${p[3]}</h3><p>${p[4]}</p></div>`).join('');
-const S=[['Spatial GIS','Map &amp; Gate','STAGE 01 · PLOTS IN','Load plots and apply the core-zone buffer','Upload GeoJSON, KML, SHP, GPKG or a WKT table. Dates are read day-first, small plots are clustered, and unusable boundaries are rejected early.',['✓ Any vector format','✓ Cluster polygons','✓ Date check table'],'gate_report.json','{\n "plots_loaded": 1420,\n "buffer_m": 10,\n "passed": 1388,\n "clusters_formed": 12\n}'],
-['Sentinel-1','Measure','STAGE 02 · RADAR','Extract VV/VH backscatter per plot','GRD scenes are speckle-filtered and averaged over each core zone, in parallel on the high-volume Earth Engine endpoint.',['✓ Multi-temporal filter','✓ VV, VH or VV+VH','✓ Parallel chunks'],'s1_timeseries.csv','pid,date,VV,VH\nP01,2026-07-04,-14.2,-20.8\nP01,2026-07-16,-12.9,-19.6\nP01,2026-07-28,-17.5,-23.1'],
-['Rules engine','Audit','STAGE 03 · VERIFY','Compare farmer reports with satellite status','dB_wet sets the flooded baseline, the trigger flags drying, and CHIRPS rain fills the gaps. Only spells of 3 or more days are credited.',['✓ dB_wet + Δ trigger','✓ Flowering lock','✓ 3-day rule'],'plot_verdict.json','{\n "plot": "P01",\n "AE1": "CONFIRMED",\n "AE2": "DRY_NOT_CREDITED",\n "lock_violations": 0\n}'],
-['Export','Quantify','STAGE 04 · CREDITS OUT','Convert verified dry days into net tCO₂e','Baseline CH₄ × scaling factor × GWP, minus the uncertainty deduction, only for VALID plots. Download audit CSVs and the parameter JSON.',['✓ Editable factors','✓ Audit-report CSV','✓ Parameters JSON'],'emission_ledger.json','{\n "avoided_kgCH4": 61.4,\n "gross_tCO2e": 1.72,\n "uncertainty_pct": 15,\n "net_tCO2e": 1.46\n}']];
-let cur=0,tm;
-function go(i){cur=i;$('sp').innerHTML=S.map((s,k)=>`<button class="st ${k==i?'on':''}" onclick="go(${k});play()"><span>${s[0]}</span><b>${s[1]}</b><div class="bar"></div></button>`).join('');
- const s=S[i];$('pb').innerHTML=s[2];$('pt').innerHTML=s[3];$('pd').innerHTML=s[4];$('pg').innerHTML=s[5].map(t=>`<span class="tag">${t}</span>`).join('');$('ph').textContent=s[6];$('pc').textContent=s[7]}
-function play(){clearInterval(tm);tm=setInterval(()=>go((cur+1)%4),7000)}
-go(0);play();filt('all');
+const C = __CFG__;
+const log = m => console.error(m);
+const abs = u => { try { return u.startsWith('/') ? window.parent.location.origin + u : u; } catch (e) { return u; } };
+let keep = null;
+try { keep = JSON.parse(sessionStorage.getItem('topoView')); } catch (e) {}
+if (keep && keep.sig !== C.sig) keep = null;
+const map = L.map('m', {preferCanvas: true, zoomSnap: 0.5}).setView(keep ? keep.c : [21, 79], keep ? keep.z : 5.5);
+map.on('moveend', () => { try { sessionStorage.setItem('topoView', JSON.stringify({sig: C.sig, c: map.getCenter(), z: map.getZoom()})); } catch (e) {} });
+L.control.scale().addTo(map);
+if (C.base) L.tileLayer(C.base, {maxZoom: 20, attribution: C.basemap}).addTo(map);
+[['topo', 300], ['dem_pane', 310], ['water_pane', 315], ['con_pane', 320], ['conlab_pane', 325], ['road_pane', 330], ['vsr_pane', 335], ['osm_pane', 400], ['vil_pane', 450]]
+  .forEach(([n, z]) => { map.createPane(n).style.zIndex = z; });
 
-/* ---- open the Streamlit side panel (CTA) ---- */
-function openPanel(){try{const d=window.parent.document;
- const b=d.querySelector('[data-testid="stExpandSidebarButton"]')||d.querySelector('[data-testid="stSidebarCollapsedControl"] button')||d.querySelector('[data-testid="collapsedControl"] button')||d.querySelector('[data-testid="stSidebarCollapsedControl"]');
- if(b)b.click();}catch(e){}}
-/* ---- keep the side panel closed when the site is first opened ---- */
-setTimeout(()=>{try{const d=window.parent.document,sb=d.querySelector('[data-testid="stSidebar"]');
- if(sb&&sb.getAttribute('aria-expanded')==='true'){const c=d.querySelector('[data-testid="stSidebarCollapseButton"] button');if(c)c.click();}}catch(e){}},350);
-/* ---- auto-fit iframe height to content ---- */
-function fit(){try{const h=document.querySelector('.w').offsetHeight+30;window.frameElement.style.height=h+'px';}catch(e){}}
-window.addEventListener('load',fit);window.addEventListener('resize',fit);try{new ResizeObserver(fit).observe(document.querySelector('.w'))}catch(e){}fit();
+if (C.dem) L.imageOverlay(C.dem.url, C.dem.b, {pane: 'dem_pane', opacity: 0.75}).addTo(map);
+if (C.water) Object.entries(C.water).forEach(([k, fc]) => L.geoJSON(fc, {pane: 'water_pane', interactive: false,
+  style: f => f.geometry.type.indexOf('Line') >= 0
+    ? {color: C.wcol[k], weight: 1.6, fill: false}
+    : {color: C.wcol[k], weight: 0.8, fillColor: C.wcol[k], fillOpacity: 0.55}}).addTo(map));
+if (C.contours) L.geoJSON(C.contours, {pane: 'con_pane', interactive: false, style: {color: C.cc, weight: 0.8}}).addTo(map);
+if (C.con_labels) {
+  C.con_labels.forEach(l => L.marker([l[0], l[1]], {pane: 'conlab_pane', interactive: false, keyboard: false,
+    icon: L.divIcon({className: '', html: '<span class="cl">' + l[2] + '</span>', iconSize: [30, 12], iconAnchor: [15, 6]})}).addTo(map));
+  const updLab = () => { map.getPane('conlab_pane').style.display = map.getZoom() >= 12 ? '' : 'none'; };
+  map.on('zoomend', updLab); updLab();
+}
+if (C.roads) L.geoJSON(C.roads, {pane: 'road_pane', interactive: false, style: {color: C.rc, weight: 2}}).addTo(map);
+
+const wmIcon = L.divIcon({className: '', iconSize: [30, 34], iconAnchor: [15, 12],
+  html: '<svg width="30" height="34" viewBox="-15 -13 30 34"><g stroke="#fff" stroke-width="4.5" stroke-linecap="round"><path d="M0 0L0 -11M0 0L-9.5 5.5M0 0L9.5 5.5M0 0L0 18"/></g>'
+      + '<path d="M0 0L0 -11M0 0L-9.5 5.5M0 0L9.5 5.5M0 0L0 18" stroke="#000" stroke-width="2" stroke-linecap="round"/><circle r="2.6" fill="#000" stroke="#fff"/></svg>'});
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// Bhuvan villages (viewer only): whole polygons intersecting the buffer, attributes shown on hover
+if (C.vil) {
+    const vs = {color: C.vc, weight: 2, fillColor: C.vc, fillOpacity: 0.06};
+  L.geoJSON(C.vil, {pane: 'vil_pane', renderer: L.svg({pane: 'vil_pane'}), style: () => vs, onEachFeature: (f, l) => {
+    const p = f.properties || {}, nk = Object.keys(p).find(k => k.toLowerCase() === 'v_name');
+    l.bindTooltip('<div style="font:12px Arial,sans-serif"><b>' + esc(nk ? p[nk] : 'Village') + '</b><table>'
+      + Object.entries(p).filter(([k, v]) => v !== '').map(([k, v]) => '<tr><td style="padding:1px 8px 1px 0;color:#555">' + esc(k)
+      + '</td><td>' + esc(v) + '</td></tr>').join('') + '</table></div>', {sticky: true});
+    l.on({mouseover: e => e.target.setStyle({weight: 2.5, fillOpacity: 0.25}), mouseout: e => e.target.setStyle(vs)});
+  }}).addTo(map);
+}
+
+// siteG = vectors + their buffers (2/5/10 km ...) shown on every tab except Vantage; vsG = WTG site + WTG buffer + vantage results (Vantage tab only)
+const siteG = L.layerGroup().addTo(map), vsG = L.layerGroup();
+let all = null;
+C.layers.forEach(lay => {
+  const n = lay.bufs.length, dash = lay.dash ? '8,6' : null, cols = lay.cols || C.colors;
+  const grow = g => { all = all ? all.extend(g.getBounds()) : g.getBounds(); };
+    lay.bufs.forEach((b, i) => grow(L.geoJSON(b.gj, {style: {color: cols[Math.min(i, cols.length - 1)], weight: 2.5, dashArray: dash, fill: false},
+    pointToLayer: (f, ll) => L.marker(ll, {icon: wmIcon})}).bindTooltip(b.label, {sticky: true}).addTo(siteG)));
+    grow(L.geoJSON(lay.fc, {
+        style: f => (lay.v2 && f.geometry.type.indexOf('Point') >= 0)
+      ? {color: '#fff', weight: 2, fillColor: lay.scol || C.colors[0], fillOpacity: 1}
+      : {color: lay.scol || C.colors[0], weight: Math.max(C.sw * 2.4, 0.8), dashArray: dash, fill: true, fillOpacity: 0},
+    pointToLayer: (f, ll) => lay.v2
+      ? L.circleMarker(ll, {radius: 8})
+      : L.marker(ll, {icon: wmIcon}),
+    onEachFeature: (f, layer) => {
+      const p = f.properties || {};
+      const nk = Object.keys(p).find(k => k.toLowerCase() === 'name' && p[k] !== null && p[k] !== '');
+      layer.bindTooltip(nk ? String(p[nk]) : lay.name, {sticky: true});
+      const rows = Object.entries(p).filter(([k, v]) => v !== null && v !== '')
+        .map(([k, v]) => '<tr><td style="padding:2px 8px 2px 0;color:#555;vertical-align:top"><b>' + esc(k) + '</b></td><td style="padding:2px 0;word-break:break-word">' + esc(v) + '</td></tr>').join('');
+      layer.bindPopup('<div style="font:12px Arial,sans-serif"><div style="font-weight:bold;margin-bottom:4px">' + esc(lay.name) + '</div>'
+        + (rows ? '<table>' + rows + '</table>' : '<i>No attributes</i>') + '</div>', {maxWidth: 340, maxHeight: 260});
+    }}).addTo(siteG));
+});
+if (all && !keep) map.fitBounds(all.pad(0.1));
+if (C.georef.length && !keep) map.fitBounds(L.latLngBounds(C.georef.flat(1)).pad(0.1));
+
+// vantage analysis (Batch 1): black WTG buffer (white halo so it reads on satellite), WTG markers, optional raster, vantage points
+let vbB = null;
+if (C.vbuf) {
+  L.geoJSON(C.vbuf, {interactive: false, style: {color: '#ffffff', weight: 6, opacity: 0.9, fill: false}}).addTo(vsG);
+  const vb = L.geoJSON(C.vbuf, {interactive: false, style: {color: C.vbc, weight: 2.5, dashArray: '8,5', fill: false}}).addTo(vsG);
+  vbB = vb.getBounds();
+}
+(C.vr || []).forEach(r => L.imageOverlay(r.url, r.b, {pane: 'vsr_pane', opacity: 1, interactive: false, className: 'vsr'}).addTo(vsG));
+(C.wtg || []).forEach(w => L.marker([w[0], w[1]], {icon: wmIcon}).bindTooltip(esc(w[2]), {direction: 'top'}).addTo(vsG));
+(C.vp || []).forEach(b => b.pts.forEach(q => L.circleMarker([q[0], q[1]], {radius: 8, color: '#fff', weight: 2, fillColor: b.color, fillOpacity: 1})
+  .bindTooltip(q[2], {sticky: true})
+  .bindPopup('<div style="font:12px Arial,sans-serif"><b>' + esc(q[2]) + '</b><br>Elevation: ' + q[4] + ' m<br>WTGs visible (' + q[5] + '): ' + esc(q[3]) + '</div>', {maxWidth: 300})
+  .addTo(vsG)));
+
+// Tab-aware content. Modes: 'vs' = Vantage tab open (vantage layers only), 'main' = another tab open (original vectors + buffers only),
+// 'both' = the open tab cannot be determined (parent page unreadable / Vantage tab not found) -> show everything so nothing is ever hidden.
+// A layer switch is always present for manual control. The tab is polled every 300 ms; the legend groups follow the same mode.
+if (C.vbuf) {
+  let mode = null;
+  const apply = m => {
+    if (m === mode) return;
+    const first = mode === null;
+    mode = m;
+    if (m === 'main') map.removeLayer(vsG); else map.addLayer(vsG);
+    if (m === 'vs') map.removeLayer(siteG); else map.addLayer(siteG);
+    if (m === 'vs' && vbB && !(first && keep)) map.fitBounds(vbB.pad(0.1));
+    else if (m === 'both' && first && !keep && !all && vbB) map.fitBounds(vbB.pad(0.1));
+    else if (m === 'main' && !first && all) map.fitBounds(all.pad(0.1));
+  };
+  const probe = () => {
+    try {
+      const D = window.parent.document;
+      const t = [...D.querySelectorAll('[role="tab"]')].find(x => /vantage/i.test(x.textContent || ''));
+      if (!t) return 'both';
+      const s = t.getAttribute('aria-selected');
+      return s === null ? 'both' : (s === 'true' ? 'vs' : 'main');
+    } catch (e) { return 'both'; }
+  };
+  const legend = m => {
+    try {
+      const D = window.parent.document;
+      D.querySelectorAll('.lgg-main').forEach(e => { e.style.display = m === 'vs' ? 'none' : ''; });
+      D.querySelectorAll('.lgg-vs').forEach(e => { e.style.display = m === 'main' ? 'none' : ''; });
+    } catch (e) {}
+  };
+  L.control.layers(null, {'Site vectors & buffers': siteG, 'Vantage analysis (Batch 1)': vsG}, {collapsed: true, position: 'topright'}).addTo(map);
+  const tick = () => { const m = probe(); apply(m); legend(m); };
+  tick();
+  setInterval(tick, 300);
+}
+
+// PMTiles source that caches every byte range in the browser Cache API
+class CSrc {
+  constructor(url, v) { this.url = url; this.v = v; }
+  getKey() { return this.url; }
+  async getBytes(o, l, sig) {
+    const k = this.url + '?v=' + this.v + '&r=' + o + '-' + (o + l - 1);
+    let c = null;
+    try { c = await caches.open('pm1'); const h = await c.match(k); if (h) return {data: await h.arrayBuffer()}; } catch (e) {}
+    const r = await fetch(this.url, {signal: sig, headers: {Range: 'bytes=' + o + '-' + (o + l - 1)}});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const b = await r.arrayBuffer();
+    if (r.status === 200 && b.byteLength !== l) throw new Error('server ignored Range');
+    try { if (c) await c.put(k, new Response(b.slice(0))); } catch (e) {}
+    return {data: b};
+  }
+}
+// z0-12 part: normal. z13-14 detail strips: shown from z13, overzoomed beyond z14, drawn above the all-India part
+const addPM = async (url, v) => {
+  const src = new pmtiles.PMTiles(new CSrc(url, v)), h = await src.getHeader();
+  pmtiles.leafletRasterLayer(src, {pane: 'topo', minZoom: h.minZoom, maxNativeZoom: h.maxZoom,
+    maxZoom: h.minZoom >= 13 ? 20 : h.maxZoom, zIndex: h.minZoom, opacity: 0.85, keepBuffer: 4}).addTo(map);
+};
+(async () => {
+  for (const g of (C.geo_img || [])) {
+    try { await addPM(abs(g.alt), g.v); }
+    catch (e) { log(g.name + ': PMTiles preview failed -> image preview'); L.imageOverlay(g.url, g.b, {pane: 'topo', opacity: 0.85}).addTo(map); }
+  }
+  for (const p of C.pm) {
+    let ok = false;
+    for (const [label, url] of [['R2', p.r2], ['Hugging Face direct', p.alt]]) {
+      if (!url) continue;
+      try { await addPM(url, p.v); ok = true; break; } catch (e) { log(p.name + ': ' + label + ' failed -> ' + (e && e.message || e)); }
+    }
+    if (!ok) log(p.name + ': SKIPPED (all sources failed)');
+  }
+})();
+
+// one-time warm-up per browser and data version: zoomed-out tiles of every low-zoom sheet (never the z13+ detail strips)
+setTimeout(async () => {
+  try { if (!C.all.length || localStorage.getItem('pmWarm') === C.wv) return; } catch (e) { return; }
+  const q = C.all.slice();
+  const run = async () => {
+    for (let p; (p = q.shift());) {
+      try {
+        const s = new pmtiles.PMTiles(new CSrc(p.r2, p.v)), h = await s.getHeader();
+        if (h.minZoom > 8) continue;
+        for (let z = h.minZoom; z <= Math.min(h.minZoom + 2, h.maxZoom); z++) {
+          const n = 2 ** z, cl = v => Math.min(n - 1, Math.max(0, Math.floor(v)));
+          const tx = lo => cl((lo + 180) / 360 * n), ty = la => cl((1 - Math.asinh(Math.tan(la * Math.PI / 180)) / Math.PI) / 2 * n);
+          for (let x = tx(h.minLon); x <= tx(h.maxLon); x++)
+            for (let y = ty(h.maxLat); y <= ty(h.minLat); y++) await s.getZxy(z, x, y);
+        }
+      } catch (e) {}
+    }
+  };
+  await Promise.all([run(), run(), run(), run()]);
+  try { localStorage.setItem('pmWarm', C.wv); } catch (e) {}
+}, 3000);
+
+if (C.osm_index) {
+  L.geoJSON(C.osm_index, {
+    pane: 'osm_pane',
+    style: () => ({color: '#ff4400', weight: 1, fill: false, fillOpacity: 0}),
+    onEachFeature: function(feature, layer) {
+      const p = feature.properties || {}, sheetName = p.EVEREST_SH || Object.values(p).find(v => typeof v === 'string') || 'N/A';
+      layer.bindTooltip(sheetName, {sticky: true, direction: 'auto'});
+      layer.on({
+        mouseover: e => { e.target.setStyle({color: '#000000', weight: 2.5}); e.target.bringToFront(); },
+        mouseout:  e => { e.target.setStyle({color: '#ff4400', weight: 1}); }
+      });
+    }
+  }).addTo(map);
+}
 </script>
 """
 
-def landing():
-    components.html(LANDING, height=1500, scrolling=False)
-
-# ============================================================ GEE + LOGO
-@st.cache_resource
-def init_gee():
-    try:
-        if "gee" in st.secrets:
-            info = dict(st.secrets["gee"]); creds = ee.ServiceAccountCredentials(info["client_email"], key_data=json.dumps(info))
-        else:
-            creds = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_PATH)
-        try: ee.Initialize(creds, project=GEE_PROJECT, opt_url="https://earthengine-highvolume.googleapis.com")
-        except Exception: ee.Initialize(creds, project=GEE_PROJECT)
-        return True, ""
-    except Exception as e:
-        return False, str(e)
-
-def hf_token():
-    try: t = st.secrets.get("HF_TOKEN", None)
-    except Exception: t = None
-    return t or os.getenv("HF_TOKEN")
-
-@st.cache_resource
-def get_logo():
-    try:
-        from PIL import Image, ImageChops
-        names = ("logo.png", "logo.jpg", "logo.jpeg")
-        dirs = [os.path.dirname(os.path.abspath(__file__)), os.getcwd()]
-        p = next((os.path.join(d, n) for d in dirs for n in names if os.path.exists(os.path.join(d, n))), None)
-        if p is None:
-            from huggingface_hub import hf_hub_download
-            tok = hf_token()
-            for n in names[:2]:
-                try: p = hf_hub_download(HF_REPO, n, repo_type="dataset", token=tok); break
-                except Exception: pass
-        im = Image.open(p).convert("RGB")
-        bb = ImageChops.difference(im, Image.new("RGB", im.size, (255, 255, 255))).convert("L").point(lambda v: 255 if v > 25 else 0).getbbox()
-        im = im.crop(bb) if bb else im
-        im.thumbnail((600, 200)); buf = io.BytesIO(); im.save(buf, "PNG")
-        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
-    except Exception:
-        return None
-
-# process-wide store: survives Streamlit reruns, so background jobs keep running while the user clicks around
-@st.cache_resource
-def job_store(): return {"jobs": {}, "cache": {}}
-STORE = job_store()
-
-gee_ok, gee_err = init_gee()
-logo = get_logo()
-
-# ============================================================ DATA HELPERS
-def _table_to_gdf(df):
-    import shapely
-    gcol = next((c for c in df.columns if c.strip().lower() in ("wkt_geom", "wkt", "geometry", "geom", "the_geom")), None)
-    if gcol is None: raise ValueError("No WKT geometry column found (expected wkt_geom / wkt / geometry).")
-    df = df.copy()
-    return gpd.GeoDataFrame(df, geometry=shapely.force_2d(shapely.from_wkt(df.pop(gcol).astype(str).to_numpy())), crs=4326)
-
-def load_vector(name, raw, pasted=""):
-    import shapely
-    if not name: return _table_to_gdf(pd.read_csv(io.StringIO(pasted.strip()), sep=None, engine="python", dtype=str))
-    low = name.lower()
-    if low.endswith((".csv", ".tsv", ".txt")): return _table_to_gdf(pd.read_csv(io.BytesIO(raw), sep=None, engine="python", dtype=str))
-    if low.endswith((".xlsx", ".xls")): return _table_to_gdf(pd.read_excel(io.BytesIO(raw), dtype=str))
-    import fiona
-    fiona.drvsupport.supported_drivers["KML"] = "rw"; fiona.drvsupport.supported_drivers["LIBKML"] = "rw"
-    path = os.path.join(tempfile.mkdtemp(), name); open(path, "wb").write(raw)
-    gdf = (gpd.read_file("zip://" + path) if low.endswith(".zip") else gpd.read_file(path)).to_crs(4326)
-    gdf["geometry"] = gpd.GeoSeries(shapely.force_2d(np.asarray(gdf.geometry.values)), index=gdf.index, crs=4326)
-    return gdf
-
-@st.cache_data(show_spinner="Reading plots…")
-def load_cached(name, raw, pasted): return load_vector(name, raw, pasted)
-
-def parse_day(x):
-    if x is None or (not isinstance(x, (pd.Timestamp, dt.date)) and (pd.isna(x) or not str(x).strip())): return pd.NaT
-    if isinstance(x, (pd.Timestamp, dt.date)): return pd.Timestamp(x)
-    t = str(x).strip()
-    if len(t) >= 10 and t[:4].isdigit() and t[4] == "-": return pd.to_datetime(t[:10], errors="coerce")
-    return pd.to_datetime(t, dayfirst=True, errors="coerce")
-
-def pdate(s):
-    """Vectorised day-first date parser (ISO and Excel dates stay year-month-day)."""
-    if pd.api.types.is_datetime64_any_dtype(s): return s
-    t = s.astype("string").str.strip()
-    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
-    iso = t.str.match(r"^\d{4}-\d{2}-\d{2}").fillna(False).astype(bool)
-    if iso.any(): out[iso] = pd.to_datetime(t[iso].str[:10], errors="coerce")
-    rest = (~iso) & t.notna() & (t != "")
-    if rest.any():
-        try: out[rest] = pd.to_datetime(t[rest], dayfirst=True, errors="coerce", format="mixed")
-        except (ValueError, TypeError): out[rest] = t[rest].apply(parse_day)
-    return out
-
-def auto_range(g, cols):
-    """Default window from the file: earliest date - 10 d ... latest date (or anchor + 120 d) + 12 d, capped at today."""
-    try:
-        pc = lambda h: next((c for c in cols if h in c.lower() and "iso" not in c.lower()), None)
-        d = pd.concat([pdate(g[c]) for c in map(pc, ("sowing", "transplant", "pipe", "aeration_1", "aeration_2")) if c]).dropna()
-        a = pd.concat([pdate(g[c]) for c in map(pc, ("sowing", "transplant")) if c]).dropna()
-        lo = d.min() - pd.Timedelta(days=10)
-        hi = min(max(d.max(), a.max() + pd.Timedelta(days=120)) + pd.Timedelta(days=12), pd.Timestamp.today())
-        if lo < hi: return lo.date(), hi.date()
-    except Exception: pass
-    return dt.date.today() - dt.timedelta(days=150), dt.date.today()
-
-def _cached(key_parts, fn, on_progress=None):
-    key = hashlib.md5(repr(key_parts).encode()).hexdigest(); store = STORE["cache"]; hit = store.get(key)
-    if hit and time.time() - hit[0] < 3600:
-        if on_progress: on_progress(1.0)
-        return hit[1]
-    val = fn(); store[key] = (time.time(), val)
-    return val
-
-def fetch_s1(feats_json, start, end, orbit, on_progress=None):
-    return _cached(("s1", feats_json, start, end, orbit), lambda: _fetch_s1_raw(feats_json, start, end, orbit, on_progress), on_progress)
-
-def fetch_chirps_all(pts_json, start, end, on_progress=None):
-    return _cached(("rain", pts_json, start, end), lambda: _fetch_chirps_raw(pts_json, start, end, on_progress), on_progress)
-
-def _fetch_s1_raw(feats_json, start, end, orbit, on_progress=None):
-    """Mean VV/VH (dB, speckle-filtered) per plot per date, chunked and queried in parallel."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    from shapely.geometry import shape
-    feats = json.loads(feats_json)
-    def _valid(f):
-        try: return bool(np.isfinite(shape(f["geom"]).bounds).all())
-        except Exception: return False
-    feats = [f for f in feats if _valid(f)]
-    if not feats: return pd.DataFrame()
-    def key(f):
-        b = shape(f["geom"]).bounds
-        return (int((b[1] + b[3]) * 5), (b[0] + b[2]) / 2)
-    feats.sort(key=key)
-    days = max((pd.Timestamp(end) - pd.Timestamp(start)).days, 1)
-    size = int(max(20, min(300, 60000 // (2 * (days // (6 if orbit == "BOTH" else 12) + 1)))))
-    def run(chunk, depth=0):
-        try:
-            bs = [shape(f["geom"]).bounds for f in chunk]
-            region = ee.Geometry.Rectangle([min(b[0] for b in bs), min(b[1] for b in bs), max(b[2] for b in bs), max(b[3] for b in bs)])
-            fc = ee.FeatureCollection([ee.Feature(ee.Geometry(f["geom"]), {"pid": f["pid"]}) for f in chunk])
-            col = (ee.ImageCollection("COPERNICUS/S1_GRD").filterBounds(region).filterDate(start, end)
-                   .filter(ee.Filter.eq("instrumentMode", "IW"))
-                   .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VV"))
-                   .filter(ee.Filter.listContains("transmitterReceiverPolarisation", "VH")))
-            if orbit != "BOTH": col = col.filter(ee.Filter.eq("orbitProperties_pass", orbit))
-            lin = col.select(["VV", "VH"]).map(lambda im: ee.Image(10).pow(im.divide(10)).copyProperties(im, im.propertyNames()))
-            tm = lin.mean(); box = tm.focal_mean(3, "square", "pixels")
-            flt = lin.map(lambda im: ee.Image(10).multiply(im.multiply(box.divide(tm)).log10())
-                          .copyProperties(im, ["system:time_start", "system:index"])).sort("system:time_start")
-            stats = flt.toBands().reduceRegions(fc, ee.Reducer.mean(), 10, tileScale=4)
-            meta = ee.Dictionary({"idx": flt.aggregate_array("system:index"), "t": flt.aggregate_array("system:time_start")}).getInfo()
-            if not meta["idx"]: return []
-            rows = []
-            for ft in stats.getInfo()["features"]:
-                pr = ft["properties"]
-                for i, t in zip(meta["idx"], meta["t"]):
-                    vv, vh = pr.get(f"{i}_VV"), pr.get(f"{i}_VH")
-                    if vv is not None and vh is not None: rows.append({"pid": pr["pid"], "VV": vv, "VH": vh, "t": t})
-            return rows
-        except Exception as e:
-            print(f"S1 chunk of {len(chunk)} failed at depth {depth}: {e}", flush=True)
-            if len(chunk) > 5 and depth < 2:
-                h = len(chunk) // 2
-                return run(chunk[:h], depth + 1) + run(chunk[h:], depth + 1)
-            raise
-    chunks = [feats[i:i + size] for i in range(0, len(feats), size)]
-    out = []
-    with ThreadPoolExecutor(max_workers=min(10, len(chunks))) as ex:
-        for k_, fut in enumerate(as_completed([ex.submit(run, c) for c in chunks]), 1):
-            out += fut.result()
-            if on_progress: on_progress(k_ / len(chunks))
-    df = pd.DataFrame(out)
-    if df.empty: return df
-    df["date"] = pd.to_datetime(df["t"], unit="ms").dt.normalize()
-    return df.groupby(["pid", "date"], as_index=False)[["VV", "VH"]].mean().sort_values(["pid", "date"])
-
-def _fetch_chirps_raw(pts_json, start, end, on_progress=None):
-    """Daily CHIRPS V3 rain, one query per 0.05 deg pixel. Returns ({cell: DataFrame(date, rain)}, {plot id: cell})."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    pts = json.loads(pts_json); step = 0.05
-    cell_of = {p: f"{int(np.floor(x / step))}_{int(np.floor(y / step))}" for p, x, y in pts}
-    cells = sorted(set(cell_of.values()))
-    per = max(1, min(40, 4500 // max((pd.Timestamp(end) - pd.Timestamp(start)).days, 1)))
-    col = ee.ImageCollection("UCSB-CHC/CHIRPS/V3/DAILY_SAT").filterDate(start, end).select("precipitation")
-    def run(chunk):
-        fc = ee.FeatureCollection([ee.Feature(ee.Geometry.Point([(int(c.split("_")[0]) + .5) * step, (int(c.split("_")[1]) + .5) * step]), {"cell": c}) for c in chunk])
-        def per_img(im):
-            t = im.get("system:time_start")
-            return im.reduceRegions(fc, ee.Reducer.mean(), 5566).map(lambda f: ee.Feature(None, {"cell": f.get("cell"), "rain": f.get("mean"), "t": t}))
-        return [f["properties"] for f in col.map(per_img).flatten().filter(ee.Filter.notNull(["rain"])).getInfo()["features"]]
-    out, chunks = [], [cells[i:i + per] for i in range(0, len(cells), per)]
-    with ThreadPoolExecutor(max_workers=min(6, len(chunks))) as ex:
-        for k_, fut in enumerate(as_completed([ex.submit(run, c) for c in chunks]), 1):
-            out += fut.result()
-            if on_progress: on_progress(k_ / len(chunks))
-    df = pd.DataFrame(out)
-    if df.empty: return {}, cell_of
-    df["date"] = pd.to_datetime(df["t"], unit="ms").dt.normalize()
-    return {c: d[["date", "rain"]].sort_values("date") for c, d in df.groupby("cell")}, cell_of
-
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_s2(geom_json, start, end, cloud):
-    """Sentinel-2 SR indices (mean inside the plot) per date, cloud/shadow masked with SCL."""
-    geom = ee.Geometry(json.loads(geom_json))
-    col = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED").filterBounds(geom).filterDate(start, end).filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud)))
-    def proc(im):
-        scl = im.select("SCL")
-        ok = scl.neq(3).And(scl.neq(8)).And(scl.neq(9)).And(scl.neq(10)).And(scl.neq(11))
-        r = im.select(["B2", "B3", "B4", "B8", "B11"]).divide(10000).updateMask(ok)
-        nir, red, blue = r.select("B8"), r.select("B4"), r.select("B2")
-        idx = ee.Image.cat([
-            r.normalizedDifference(["B8", "B4"]).rename("NDVI"), r.normalizedDifference(["B8", "B11"]).rename("NDMI"),
-            r.normalizedDifference(["B3", "B8"]).rename("NDWI"), r.normalizedDifference(["B3", "B11"]).rename("MNDWI"),
-            nir.subtract(red).multiply(2.5).divide(nir.add(red.multiply(6)).subtract(blue.multiply(7.5)).add(1)).rename("EVI"),
-            nir.subtract(red).multiply(1.5).divide(nir.add(red).add(0.5)).rename("SAVI")])
-        stt = idx.reduceRegion(ee.Reducer.mean(), geom, 10, maxPixels=1e9, bestEffort=True)
-        clear = ok.rename("clear").reduceRegion(ee.Reducer.mean(), geom, 10, maxPixels=1e9, bestEffort=True).get("clear")
-        return ee.Feature(None, stt.set("t", im.get("system:time_start")).set("clear", clear).set("cloud", im.get("CLOUDY_PIXEL_PERCENTAGE")))
-    df = pd.DataFrame([f["properties"] for f in col.map(proc).filter(ee.Filter.notNull(["NDVI"])).getInfo()["features"]])
-    if df.empty: return df
-    df["date"] = pd.to_datetime(df["t"], unit="ms").dt.normalize()
-    return df.drop(columns="t").groupby("date", as_index=False).mean().sort_values("date")
-
-# ---------------- cluster polygons
-def build_units(g, utm, mode, id_col, incl_micro, buf, fm_col):
-    """DREAM A 2.3.3b: plots with no core pixel after the buffer are aggregated into Cluster Polygons."""
-    from shapely.ops import unary_union
-    g = g.copy().reset_index(drop=True)
-    pj = g.to_crs(utm)
-    g["core_m2"] = pj.geometry.buffer(-buf).area; g["area_ha"] = pj.area / 1e4
-    g["members"] = g.pid; g["n_members"] = 1; g["date_spread"] = np.nan
-    if mode == "Off": return g, pd.DataFrame()
-    n = len(g); parent = list(range(n))
-    def find(i):
-        while parent[i] != i: parent[i] = parent[parent[i]]; i = parent[i]
-        return i
-    if mode == "By column" and id_col:
-        key = g[id_col].astype(str).str.strip()
-        ok = g[id_col].notna() & (key != "") & (key.str.lower() != "nan")
-        for _, idxs in g[ok].groupby(key[ok]).groups.items():
-            idxs = list(idxs)
-            for j in idxs[1:]: parent[find(j)] = find(idxs[0])
-    else:
-        cm, ah = g.core_m2.to_numpy(), g.area_ha.to_numpy()
-        cand = set(np.flatnonzero((cm <= 0) | ((ah < 0.5) if incl_micro else False)).tolist())
-        bg = pj.geometry.buffer(1); sidx = bg.sindex
-        for i in cand:
-            for j in sidx.query(bg.iloc[i], predicate="intersects"):
-                if j in cand and j != i: parent[find(i)] = find(j)
-    groups = {}
-    for i in range(n): groups.setdefault(find(i), []).append(i)
-    out, info, cnt, single, core_arr = [], [], 0, [], g.core_m2.to_numpy()
-    for idxs in groups.values():
-        if len(idxs) < 2 or (mode != "By column" and not (core_arr[idxs] <= 0).any()):
-            single.extend(idxs); continue
-        sub_ = g.loc[idxs]; cnt += 1
-        geom = unary_union(list(pj.geometry.loc[idxs].buffer(1))).buffer(-1)
-        rec = sub_.iloc[0].to_dict()
-        rec.update(pid=f"CL{cnt:02d}", geometry=gpd.GeoSeries([geom], crs=utm).to_crs(4326).iloc[0], members=", ".join(sub_.pid),
-                   n_members=len(sub_), core_m2=geom.buffer(-buf).area, area_ha=geom.area / 1e4)
-        spread = []
-        for k_ in ["trans", "sow", "pipe_dt", "ae1", "ae2"]:
-            v = sub_[k_].dropna(); rec[k_] = v.median() if len(v) else pd.NaT
-            if len(v) > 1: spread.append((v.max() - v.min()).days)
-        rec["date_spread"] = max(spread) if spread else 0
-        if fm_col: rec[fm_col] = f"{len(sub_)} plots (cluster)"
-        out.append(rec)
-        info.append(dict(Cluster=rec["pid"], Members=rec["members"], Plots=len(sub_), Core_ha=round(rec["core_m2"] / 1e4, 4), Max_date_spread_days=rec["date_spread"]))
-    keep = g.loc[sorted(single)]
-    if out: keep = pd.concat([keep, gpd.GeoDataFrame(out, geometry="geometry", crs=4326)], ignore_index=True)
-    return gpd.GeoDataFrame(keep, geometry="geometry", crs=4326).reset_index(drop=True), pd.DataFrame(info)
-
-# ============================================================ AUDIT ENGINE
-def audit_plot(ts, p, P, rain=None):
-    """Farmer records vs Sentinel-1 following DREAM Annex A 2.3 (dB_wet, delta), A 2.3.6-7 (daily status, 3-day rule), A 2.4 (lock)."""
-    R = dict(status="NO_DATA", ts=ts.iloc[0:0], wet={}, aer={}, wet_date={}, ls=pd.NaT, le=pd.NaT, ev=[], extra=[], lock_hits=0,
-             n_obs=0, aer_hits=0, daily=pd.DataFrame(columns=["date", "dry", "credited"]), runs=[], dry_days=0, dry_events=0)
-    if pd.isna(p.anchor) or ts.empty: return R
-    D = pd.Timedelta
-    last_ev = max([d for d in [p.ae1, p.ae2] if pd.notna(d)] + [p.anchor + D(days=P["cycle"])])
-    ts = ts[(ts.date >= p.anchor - D(days=5)) & (ts.date <= last_ev + D(days=P["tol"]))].copy()
-    if ts.empty: return R
-    ts["VV+VH"] = 10 * np.log10(10 ** (ts.VV / 10) + 10 ** (ts.VH / 10))
-    w = ts[(ts.date >= p.anchor + D(days=P["w0"])) & (ts.date <= p.anchor + D(days=P["w1"]))]
-    w = w if len(w) else ts
-    for b in ["VV", "VH", "VV+VH"]:
-        R["wet"][b] = w[b].min(); R["wet_date"][b] = w.loc[w[b].idxmin(), "date"]; R["aer"][b] = R["wet"][b] + P["delta"]
-    det = P["det"]
-    if P["lock"]:
-        hd = p.anchor + D(days=P["heading"]); R["ls"], R["le"] = hd - D(days=10), hd + D(days=10)
-    ts["inlock"] = (ts.date >= R["ls"]) & (ts.date <= R["le"])
-    ts["aerated"] = ts[det] >= R["aer"][det]
-    ts["audited"] = np.where(ts.inlock, R["wet"][det] - 1, ts[det])
-    R.update(ts=ts, n_obs=len(ts), lock_hits=int((ts.aerated & ts.inlock).sum()), aer_hits=int((ts.aerated & ~ts.inlock).sum()))
-
-    o = ts.sort_values("date").reset_index(drop=True)
-    dry_obs = (o.aerated & ~o.inlock).to_numpy()
-    days = pd.date_range(o.date.iloc[0], o.date.iloc[-1], freq="D")
-    dry = pd.Series(False, index=days)
-    rs = rain.set_index("date").rain if rain is not None and len(rain) else pd.Series(dtype=float)
-    for i in range(len(o)):
-        d0 = o.date.iloc[i]; dry.loc[d0] = bool(dry_obs[i])
-        if i + 1 == len(o): break
-        d1 = o.date.iloc[i + 1]; gap = pd.date_range(d0 + D(days=1), d1 - D(days=1), freq="D")
-        if len(gap) == 0: continue
-        if dry_obs[i] and dry_obs[i + 1]: dry.loc[gap] = not (rs.reindex(gap).max() >= P["rain"])
-        elif dry_obs[i + 1]: dry.loc[gap[gap >= d0 + (d1 - d0) / 2]] = True
-    if P["lock"]: dry[(dry.index >= R["ls"]) & (dry.index <= R["le"])] = False
-    vals, runs, start = dry.to_numpy(), [], None
-    for k, v in enumerate(vals):
-        if v and start is None: start = k
-        if start is not None and (not v or k == len(vals) - 1):
-            e_ = k if v else k - 1
-            runs.append((days[start], days[e_], e_ - start + 1)); start = None
-    runs = [r for r in runs if r[2] >= 3]
-    cred = pd.Series(False, index=days)
-    for a_, b_, _ in runs: cred.loc[a_:b_] = True
-    R.update(daily=pd.DataFrame({"date": days, "dry": vals, "credited": cred.to_numpy()}), runs=runs, dry_days=int(cred.sum()), dry_events=len(runs))
-
-    tol = D(days=P["tol"]); matched = set(); dd = R["daily"]
-    for name, d in [("Aeration 1", p.ae1), ("Aeration 2", p.ae2)]:
-        if pd.isna(d): continue
-        near = ts[(ts.date >= d - tol) & (ts.date <= d + tol)]
-        if near.empty:
-            R["ev"].append(dict(name=name, date=d, verdict="NO_PASS", obs=None, val=None, hit=False)); continue
-        hit = near[near.aerated & ~near.inlock]
-        credited = dd[dd.credited & (dd.date >= d - tol) & (dd.date <= d + tol)]
-        pool = hit if len(hit) else near
-        o_ = pool.iloc[(pool.date - d).abs().argsort().iloc[0]]
-        verdict = "CONFIRMED" if len(credited) else ("DRY_NOT_CREDITED" if len(hit) else "NOT_CONFIRMED")
-        R["ev"].append(dict(name=name, date=d, verdict=verdict, obs=o_.date, val=o_[det], hit=len(hit) > 0))
-        if verdict == "CONFIRMED" and len(hit): matched.add(o_.date)
-    R["extra"] = [r.date for r in ts[ts.aerated & ~ts.inlock].itertuples()
-                  if r.date not in matched and all(abs((r.date - e["date"]).days) > P["tol"] for e in R["ev"])]
-    verd = [e["verdict"] for e in R["ev"]]
-    if R["lock_hits"] > 0: R["status"] = "LOCK_VIOLATION"
-    elif verd and all(v == "CONFIRMED" for v in verd): R["status"] = "VALID"
-    elif "CONFIRMED" in verd: R["status"] = "PARTIAL"
-    elif verd: R["status"] = "NOT_CONFIRMED"
-    else: R["status"] = "VALID" if R["dry_events"] > 0 else "NO_AERATION"
-    return R
-
-# ---------------- exports + extracted ranges (built once)
-def make_exports(gdf, rep):
-    g = gpd.GeoDataFrame(gdf[["pid", "geometry"]].merge(rep, left_on="pid", right_on="Plot_ID").drop(columns="pid"), geometry="geometry", crs=4326)
-    for c in g.columns:
-        if c != "geometry" and pd.api.types.is_datetime64_any_dtype(g[c]): g[c] = g[c].dt.strftime("%Y-%m-%d")
-    out = {"csv": rep.to_csv(index=False).encode(), "geojson": g.to_json().encode(), "kml": None, "shp": None}
-    d = tempfile.mkdtemp()
-    try:
-        g.to_file(os.path.join(d, "awd.kml"), driver="KML"); out["kml"] = open(os.path.join(d, "awd.kml"), "rb").read()
-    except Exception: pass
-    try:
-        os.makedirs(os.path.join(d, "shp")); g.to_file(os.path.join(d, "shp", "awd_audit.shp"))
-        out["shp"] = open(shutil.make_archive(os.path.join(d, "awd_shp"), "zip", os.path.join(d, "shp")), "rb").read()
-    except Exception: pass
-    return out
-
-def ring_json(geom):
-    """Polygon boundary as a JSON-style list of {"lat": .., "lng": ..} dictionaries (largest part for multi-polygons)."""
-    try:
-        if geom is None or geom.is_empty: return "[]"
-        if hasattr(geom, "geoms"): geom = max(geom.geoms, key=lambda x: x.area)
-        return json.dumps([{"lat": round(y, 7), "lng": round(x, 7)} for x, y, *_ in geom.exterior.coords])
-    except Exception:
-        return "[]"
-
-def ranges_table(g, Q):
-    """All uploaded rows: original attributes + satellite date range per plot + boundary as lat/lng list in column `range`."""
-    d = pd.DataFrame(g.drop(columns="geometry")).copy()
-    cs = [Q[k] for k in ("c_sw", "c_tr", "c_pp", "c_a1", "c_a2") if Q[k]]
-    dd = pd.concat([pdate(d[c]) for c in cs], axis=1)
-    a1, a2 = (Q["c_sw"], Q["c_tr"]) if Q["anchor_mode"] == "Sowing" else (Q["c_tr"], Q["c_sw"])
-    anc = pdate(d[a1]) if a1 else pd.Series(pd.NaT, index=d.index)
-    if a2: anc = anc.fillna(pdate(d[a2]))
-    last = pd.concat([dd.max(axis=1), anc + pd.Timedelta(days=Q["cycle"])], axis=1).max(axis=1)
-    frm = dd.min(axis=1) - pd.Timedelta(days=10)
-    to = (last + pd.Timedelta(days=Q["tol"] + 6)).clip(upper=pd.Timestamp.today().normalize())
-    if Q["dr"]:                                       # the range chosen in the side panel wins
-        frm = frm.clip(lower=pd.Timestamp(Q["dr"][0])); to = to.clip(upper=pd.Timestamp(Q["dr"][1]))
-    d["Range_from"], d["Range_to"], d["Range_days"] = frm.dt.strftime("%Y-%m-%d"), to.dt.strftime("%Y-%m-%d"), (to - frm).dt.days
-    d["range"] = [ring_json(x) for x in g.geometry]
-    return d
-
-def run_pipeline(gdf, Q, prog, gdf_all):
-    """Everything heavy. Runs in a background thread (no Streamlit calls in here!)."""
-    from shapely import set_precision
-    prog(0.02, "Reading dates")
-    gdf = gdf.copy(); gdf["pid"] = gdf[Q["c_id"]].astype(str); gdf["trans"] = pdate(gdf[Q["c_tr"]])
-    for k, c in [("sow", Q["c_sw"]), ("pipe_dt", Q["c_pp"]), ("ae1", Q["c_a1"]), ("ae2", Q["c_a2"])]:
-        gdf[k] = pdate(gdf[c]) if c else pd.NaT
-    utm = gdf.estimate_utm_crs(); gdf_plots = gdf.copy()
-    prog(0.05, "Grouping small plots")
-    gdf, cl_info = build_units(gdf, utm, Q["cl_mode"], Q["cl_col"], Q["cl_micro"], Q["buffer_m"], Q["c_fm"])
-    gdf["gate"] = np.where(gdf.core_m2 > 0, "PASSED", "REJECTED")
-    a1, a2 = ("sow", "trans") if Q["anchor_mode"] == "Sowing" else ("trans", "sow")
-    gdf["anchor"] = gdf[a1].fillna(gdf[a2])
-    bnd = gdf.geometry.bounds
-    gdf["lon_c"], gdf["lat_c"] = (bnd.minx + bnd.maxx) / 2, (bnd.miny + bnd.maxy) / 2
-    out = dict(gdf=gdf, gdf_plots=gdf_plots, cl_info=cl_info, utm=utm, rain_cells={}, cell_of={})
-    try: out["ranges"] = ranges_table(gdf_all, Q)
-    except Exception as e: out["ranges"] = pd.DataFrame(gdf_all.drop(columns="geometry")); out["ranges_err"] = str(e)
-    alld = pd.concat([gdf[k] for k in ["sow", "trans", "pipe_dt", "ae1", "ae2"]]).dropna()
-    if alld.empty: out["err"] = "No valid dates found in the mapped date columns."; return out
-    tol, cycle = Q["tol"], Q["cycle"]
-    w_start = (alld.min() - pd.Timedelta(days=10)).date()
-    w_end = (max(gdf.anchor.max() + pd.Timedelta(days=cycle), alld.max()) + pd.Timedelta(days=tol + 6)).date()
-    if Q["dr"]: w_start, w_end = Q["dr"]
-    w_end = min(w_end, dt.date.today())
-    if w_start >= w_end: out["err"] = f"Date range {w_start} → {w_end} is empty (end is capped at today)."; return out
-    vg = gdf[gdf.gate == "PASSED"]
-    core = vg.geometry.to_crs(utm).buffer(-Q["buffer_m"]).to_crs(4326)
-    def _prep(g_):
-        if g_ is None or g_.is_empty: return None
-        r = set_precision(g_, 1e-6); r = r if (not r.is_empty and r.area > 0) else g_
-        return None if (r.is_empty or r.area <= 0) else r
-    prepped = [(p, _prep(g_)) for p, g_ in zip(vg.pid, core)]
-    out["skipped_empty"] = [p for p, g_ in prepped if g_ is None]
-    feats = [{"pid": p, "geom": mapping(g_)} for p, g_ in prepped if g_ is not None]
-    prog(0.10, "Sentinel-1")
-    s1 = fetch_s1(json.dumps(feats), str(w_start), str(w_end + dt.timedelta(days=1)), Q["orbit"], on_progress=lambda f: prog(0.10 + 0.55 * f, "Sentinel-1"))
-    out.update(w_start=w_start, w_end=w_end, n_gate=len(vg), custom_dr=bool(Q["dr"]))
-    if s1.empty: out["s1_empty"] = True; return out
-    try:
-        out["rain_cells"], out["cell_of"] = fetch_chirps_all(json.dumps(list(zip(gdf["pid"], gdf["lon_c"], gdf["lat_c"]))), str(w_start),
-                                                             str(w_end + dt.timedelta(days=1)), on_progress=lambda f: prog(0.65 + 0.10 * f, "CHIRPS rain"))
-    except Exception as e: out["rain_err"] = str(e)
-    s1g = {k: v for k, v in s1.groupby("pid")}
-    empty = pd.DataFrame(columns=["pid", "date", "VV", "VH"])
-    P = dict(w0=Q["w0"], w1=Q["w1"], delta=Q["delta"], heading=Q["heading"], cycle=cycle, det=Q["det"], tol=tol, lock=Q["lock_on"], rain=Q["rain_thr"])
-    det, c_fm, res, rows = Q["det"], Q["c_fm"], {}, []
-    step = max(1, len(gdf) // 50)
-    for i_, (_, p) in enumerate(gdf.iterrows()):
-        if i_ % step == 0: prog(0.75 + 0.18 * i_ / len(gdf), "Auditing plots")
-        R = audit_plot(s1g.get(p.pid, empty), p, P, out["rain_cells"].get(out["cell_of"].get(p.pid)))
-        if p.gate == "REJECTED": R["status"] = "REJECTED_SMALL"
-        res[p.pid] = R
-        ha = p.core_m2 / 1e4; base = Q["ef"] * cycle * ha
-        av = base * (1 - Q["sf"]) if R["status"] == "VALID" else 0.0
-        ev = {e["name"]: e["verdict"] for e in R["ev"]}
-        rows.append({"Plot_ID": p.pid, "Farmer": p[c_fm] if c_fm else "", "Transplant": p.trans, "Core_ha": round(ha, 4),
-                     "Gate": p.gate, f"dB_wet_{det}": R["wet"].get(det), f"dB_aer_{det}": R["aer"].get(det),
-                     "AE1_farmer": p.ae1, "AE1_check": ev.get("Aeration 1", "—"), "AE2_farmer": p.ae2, "AE2_check": ev.get("Aeration 2", "—"),
-                     "Lock_Violations": R["lock_hits"], "S1_obs": R["n_obs"], "Dry_days_credited": R["dry_days"], "Dry_events": R["dry_events"],
-                     "Members": int(p.n_members), "Status": R["status"], "Baseline_kgCH4": base, "Avoided_kgCH4": av,
-                     "Avoided_tCO2e": av * Q["gwp"] / 1000, "Net_tCO2e": av * Q["gwp"] / 1000 * (1 - Q["unc"] / 100)})
-    rep = pd.DataFrame(rows); out.update(res=res, rep=rep)
-    prog(0.95, "Building exports"); out["exp"] = make_exports(gdf, rep)
-    prog(1.0, "Done")
-    return out
-
-# ============================================================ BACKGROUND JOB
-def start_job(gdf_head, Q, gdf_all):
-    """Start run_pipeline in a daemon thread. The UI only reads job['frac'/'text'/'status'] so it never blocks."""
-    jid = uuid.uuid4().hex[:8]
-    job = dict(id=jid, status="running", frac=0.0, text="Starting", t0=time.time(), err=None, result=None)
-    now = time.time()
-    for k in list(STORE["jobs"]):                      # purge old finished jobs
-        j = STORE["jobs"][k]
-        if j["status"] != "running" and now - j["t0"] > 1800: STORE["jobs"].pop(k, None)
-    STORE["jobs"][jid] = job
-    def prog(f, text=""): job["frac"] = max(0.0, min(1.0, f)); job["text"] = text
-    def work():
-        try:
-            res = run_pipeline(gdf_head, Q, prog, gdf_all)
-            res["Q"] = Q; res["uid"] = jid; res["created"] = pd.Timestamp.now(tz="UTC").isoformat()
-            job["result"] = res; job["status"] = "done"
-        except Exception as e:
-            job["err"] = f"{type(e).__name__}: {e}"; job["status"] = "error"
-    threading.Thread(target=work, daemon=True, name=f"dmrv-{jid}").start()
-    return jid
-
-@st.fragment(run_every=2)
-def job_bar(jid):
-    """Vertical progress bar on the right edge (top to bottom). Only this fragment reruns, the page stays usable."""
-    j = STORE["jobs"].get(jid)
-    if not j: return
-    if j["status"] != "running":
-        st.rerun(); return
-    pct = int(j["frac"] * 100)
-    st.markdown(f'<div class="vbar"><div class="vfill" style="height:{pct}%"></div></div><div class="vlbl">{j["text"]} · {pct}%</div>', unsafe_allow_html=True)
-
-# ============================================================ SAVED ANALYSES (Hugging Face)
-def _hf_api():
-    from huggingface_hub import HfApi
-    return HfApi(token=hf_token())
-
-def _sign(blob): return hmac.new((AUTH_PASS + "|dmrv-analysis").encode(), blob, hashlib.sha256).hexdigest()
-
-def make_thumb(pipe):
-    """Small PNG (base64) drawing the audited polygons coloured by status."""
-    from PIL import Image, ImageDraw
-    W, H, pad = 360, 220, 14
-    im = Image.new("RGB", (W, H), (10, 35, 66)); dr = ImageDraw.Draw(im)
-    gdf, rep = pipe["gdf"], pipe["rep"]; stat = dict(zip(rep.Plot_ID, rep.Status))
-    colr = {"VALID": "#22C55E", "LOCK_VIOLATION": "#EF4444", "REJECTED_SMALL": "#EF4444", "PARTIAL": "#F59E0B", "NOT_CONFIRMED": "#F59E0B", "NO_AERATION": "#F59E0B"}
-    rgb = lambda h: tuple(int(h[i:i + 2], 16) for i in (1, 3, 5))
-    minx, miny, maxx, maxy = gdf.total_bounds
-    k = math.cos(math.radians((miny + maxy) / 2)); wx, wy = max((maxx - minx) * k, 1e-9), max(maxy - miny, 1e-9)
-    s = min((W - 2 * pad) / wx, (H - 2 * pad) / wy); ox, oy = (W - wx * s) / 2, (H - wy * s) / 2
-    pt = lambda x, y: (ox + (x - minx) * k * s, H - (oy + (y - miny) * s))
-    for pid, geom in zip(gdf.pid, gdf.geometry):
-        if geom is None or geom.is_empty: continue
-        for pg in (geom.geoms if hasattr(geom, "geoms") else [geom]):
-            if pg.geom_type != "Polygon" or pg.is_empty: continue
-            dr.polygon([pt(x, y) for x, y, *_ in pg.exterior.coords], fill=rgb(colr.get(stat.get(pid), "#94A3B8")), outline=(255, 255, 255))
-    buf = io.BytesIO(); im.save(buf, "PNG", optimize=True)
-    return base64.b64encode(buf.getvalue()).decode()
-
-def save_analysis(pipe, name, project):
-    from huggingface_hub import CommitOperationAdd
-    if not hf_token(): raise RuntimeError("HF_TOKEN is missing (add it to st.secrets or the environment).")
-    aid = dt.datetime.utcnow().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
-    blob = gzip.compress(pickle.dumps({k: v for k, v in pipe.items() if k != "sp"}, protocol=4))
-    rep, Qs = pipe["rep"], pipe["Q"]
-    meta = dict(id=aid, name=name, project=project, created=pd.Timestamp.now(tz="UTC").isoformat(),
-                range_from=str(pipe["w_start"]), range_to=str(pipe["w_end"]), n_plots=int(len(pipe["gdf_plots"])), n_units=int(len(rep)),
-                n_valid=int((rep.Status == "VALID").sum()), net_tco2e=round(float(rep.Net_tCO2e.sum()), 3), core_ha=round(float(rep.Core_ha.sum()), 2),
-                orbit=Qs["orbit"], size_kb=round(len(blob) / 1024), sig=_sign(blob), thumb=make_thumb(pipe))
-    ops = [CommitOperationAdd(f"{HF_FOLDER}/{aid}/meta.json", json.dumps(meta).encode()),
-           CommitOperationAdd(f"{HF_FOLDER}/{aid}/analysis.pkl.gz", blob)]
-    _hf_api().create_commit(repo_id=HF_REPO, repo_type="dataset", operations=ops, commit_message=f"Save dMRV analysis {aid}")
-    list_saved.clear()
-    return aid
-
-@st.cache_data(show_spinner=False, ttl=120)
-def list_saved(_v=0):
-    from huggingface_hub import hf_hub_download
-    from concurrent.futures import ThreadPoolExecutor
-    try:
-        folders = [e.path for e in _hf_api().list_repo_tree(HF_REPO, path_in_repo=HF_FOLDER, repo_type="dataset") if e.__class__.__name__ == "RepoFolder"]
-    except Exception as e:
-        if "404" in str(e) or "not found" in str(e).lower(): return dict(items=[], err="")
-        return dict(items=[], err=str(e))
-    tok = hf_token()
-    def one(p):
-        try: return json.load(open(hf_hub_download(HF_REPO, f"{p}/meta.json", repo_type="dataset", token=tok), encoding="utf-8"))
-        except Exception: return None
-    with ThreadPoolExecutor(max_workers=6) as ex: items = [m for m in ex.map(one, folders) if m]
-    items.sort(key=lambda m: m.get("created", ""), reverse=True)
-    return dict(items=items, err="")
-
-def load_saved(aid, sig):
-    from huggingface_hub import hf_hub_download
-    p = hf_hub_download(HF_REPO, f"{HF_FOLDER}/{aid}/analysis.pkl.gz", repo_type="dataset", token=hf_token())
-    blob = open(p, "rb").read()
-    if not hmac.compare_digest(_sign(blob), sig): raise ValueError("Signature mismatch: this file was not saved by this app, so it was not opened.")
-    return pickle.loads(gzip.decompress(blob))
-
-def delete_saved(aid):
-    _hf_api().delete_folder(path_in_repo=f"{HF_FOLDER}/{aid}", repo_id=HF_REPO, repo_type="dataset", commit_message=f"Delete dMRV analysis {aid}")
-    list_saved.clear()
-
-def fmt_created(s):
-    try: return pd.Timestamp(s).tz_convert(DISPLAY_TZ).strftime("%d %b %Y, %H:%M")
-    except Exception: return str(s)
-
-def saved_workspace():
-    if not hf_token():
-        st.warning("Saving / opening analyses needs a Hugging Face token with write access to the dataset repo. Add `HF_TOKEN` to `st.secrets` or the environment."); return
-    data = list_saved(); items = data["items"]
-    if data["err"]: st.error(f"Could not list saved analyses: {data['err']}")
-    if not items:
-        st.info("No saved analyses yet. Run an analysis, then press 💾 Save analysis."); return
-    for i in range(0, len(items), 3):
-        for col, it in zip(st.columns(3), items[i:i + 3]):
-            with col:
-                poly = f'{it.get("n_plots", "?")}' + (f' → {it["n_units"]} units' if it.get("n_units") not in (None, it.get("n_plots")) else "")
-                st.markdown(f'<div class="sv"><img src="data:image/png;base64,{it.get("thumb", "")}"><div class="b"><b>{it.get("name", "Analysis")}</b>'
-                            f'<div class="m">📅 <em>{it.get("range_from", "?")} → {it.get("range_to", "?")}</em><br>'
-                            f'🔷 Polygons: <em>{poly}</em> · {it.get("core_ha", "?")} ha<br>'
-                            f'✅ Valid: <em>{it.get("n_valid", "?")}</em> · ☁️ Net <em>{it.get("net_tco2e", "?")}</em> tCO₂e<br>'
-                            f'🛰 Orbit {it.get("orbit", "?")} · 🕒 Created <em>{fmt_created(it.get("created"))}</em><br>'
-                            f'<span style="color:#9AAEC7">{it.get("project", "")} · {it.get("size_kb", "?")} KB</span></div></div></div>', unsafe_allow_html=True)
-                a, b = st.columns([3, 1])
-                if a.button("Open analysis", key=f"op_{it['id']}", type="primary", use_container_width=True):
-                    try:
-                        with st.spinner("Opening saved analysis…"): P_ = load_saved(it["id"], it.get("sig", ""))
-                        P_["uid"] = "saved-" + it["id"]
-                        st.session_state.update(pipe=P_, pipe_name=it.get("name", ""), ws="run", page="Spatial Audit")
-                        st.session_state.pop("sel", None); st.rerun()
-                    except Exception as e: st.error(f"Could not open: {e}")
-                with b.popover("🗑", use_container_width=True):
-                    st.caption("Delete this saved analysis permanently?")
-                    if st.button("Yes, delete", key=f"sdel_{it['id']}", type="primary"):
-                        try: delete_saved(it["id"]); st.rerun()
-                        except Exception as e: st.error(f"Delete failed: {e}")
-
-# ============================================================ SHARED UI HELPERS
-def kpi_row(items):
-    for col, (ic, bg, v, l) in zip(st.columns(len(items)), items):
-        col.markdown(f'<div class="kpi"><div class="ic" style="background:{bg}">{ic}</div><div><div class="v">{v}</div><div class="l">{l}</div></div></div>', unsafe_allow_html=True)
-
-def esri(m):
-    folium.TileLayer("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}", attr="Esri", name="Esri Satellite").add_to(m)
-    Fullscreen().add_to(m)
-
-def preview_gdf(g_all, c_id, n_rows):
-    """Light version of the plots for browsing while the analysis is still running."""
-    pv = g_all.head(int(n_rows)).copy().reset_index(drop=True)
-    pv = pv[pv.geometry.notna() & ~pv.geometry.is_empty].reset_index(drop=True)
-    pv["pid"] = pv[c_id].astype(str); b = pv.geometry.bounds
-    pv["lon_c"], pv["lat_c"] = (b.minx + b.maxx) / 2, (b.miny + b.maxy) / 2
-    return pv
-
-def preview_map(pv):
-    m = folium.Map([pv.lat_c.mean(), pv.lon_c.mean()], zoom_start=14, tiles=None); esri(m); MousePosition().add_to(m)
-    near = pv if len(pv) <= 500 else pv.iloc[:500]
-    folium.GeoJson(near[["pid", "geometry"]], name="Plots", style_function=lambda f: {"color": "#22C55E", "weight": 2, "fillOpacity": .12},
-                   tooltip=folium.GeoJsonTooltip(["pid"])).add_to(m)
-    x0, y0, x1, y1 = pv.total_bounds; m.fit_bounds([[y0, x0], [y1, x1]]); folium.LayerControl().add_to(m)
-    components.html(m._repr_html_(), height=470)            # static: no reruns while panning
-    if len(pv) > 500: st.caption(f"Map shows the first 500 of {len(pv):,} plots.")
-
-def satellite_page(spg, lat0, lon0):
-    st.markdown("#### 📍 Sentinel-1 passes over your plots (ESA acquisition plan)")
-    c1, c2, c3, c4 = st.columns([1.3, 1, 1, 3], vertical_alignment="bottom")
-    days = int(c1.number_input("Show passes for the next … days", 1, 45, AHEAD, key="sp_days",
-                               help="Choose how far ahead to look. Passes can only be listed as far ahead as ESA has published its plans."))
-    go_run = c2.button("▶ Run passes", type="primary", use_container_width=True, key="sp_run")
-    go_ref = c3.button("🔄 Refresh plans", use_container_width=True, key="sp_ref", help="Re-download the ESA KML files and recompute")
-    c4.caption(f"Window: now → **{(pd.Timestamp.now(tz='UTC') + pd.Timedelta(days=days)):%d %b %Y}** (UTC)")
-    sig = hashlib.md5("|".join(spg.pid.astype(str)).encode()).hexdigest()
-    if go_run or go_ref:                                    # computed here only, never during 'Run analysis'
-        if go_ref: fetch_plan_kmls.clear()
-        with st.spinner("Downloading / reading ESA acquisition plans…"):
-            st.session_state["sp"] = dict(sat_plan(spg, days), sig=sig)
-    SP = st.session_state.get("sp")
-    if SP and SP.get("sig") != sig: SP = None
-    if not SP: st.info("Choose the number of days and press ▶ Run passes to download the ESA plan and match it with your plots."); return
-    if SP.get("err"): st.error(f"Could not get the ESA acquisition plans: {SP['err']}"); return
-    ahead, tbl, L = SP["ahead"], SP["tbl"], SP["lines"]
-    if ahead != days: st.caption(f"Showing results for the next {ahead} days. Press ▶ Run passes to update to {days}.")
-    has = tbl[tbl.Satellite != ""]
-    kpi_row([("📍", "#E3F0FF", f"{has.Plot.nunique()} / {len(spg)}", "Plots with a pass"), ("🛰", "#E8F7E3", f"{len(has)}", f"Pass rows in next {ahead} days"),
-             ("⏱", "#FFF1D6", f"{has.Days_ahead.min():.1f} d" if len(has) else "—", "Soonest pass")])
-    st.write("")
-    sc = spg.assign(d=(spg.lon_c - lon0) ** 2 + (spg.lat_c - lat0) ** 2).nsmallest(300, "d")
-    sc = sc.assign(passes=sc.pid.map(SP["tips"]).fillna("No pass"))
-    m = folium.Map([lat0, lon0], zoom_start=11, tiles=None); esri(m)
-    if not L.empty:
-        folium.GeoJson(L[["sat", "utc", "local", "geometry"]], name="All coming pass footprints",
-                       style_function=lambda f: {"color": "#FFD60A", "weight": 1.5, "fillOpacity": .05},
-                       highlight_function=lambda f: {"weight": 3, "fillOpacity": .2},
-                       tooltip=folium.GeoJsonTooltip(["sat", "utc", "local"], aliases=["Satellite", "UTC", "Local"], sticky=True)).add_to(m)
-    folium.GeoJson(sc[["pid", "passes", "geometry"]], name="Plots", style_function=lambda f: {"color": "#22C55E", "weight": 2, "fillOpacity": .15},
-                   tooltip=folium.GeoJsonTooltip(["pid", "passes"], aliases=["Plot", "Passes"], sticky=True)).add_to(m)
-    folium.LayerControl().add_to(m)
-    components.html(m._repr_html_(), height=480)            # static map: no reruns while panning / hovering
-    st.caption("Hover a footprint for its pass details, or a plot for all its coming passes (local time of the plot's time zone). Plans: " + ", ".join(n.rsplit(".", 1)[0] for n in SP["kmls"]))
-    st.download_button(f"⬇ All passes next {ahead} days (CSV)", tbl.to_csv(index=False), f"S1_passes_next_{ahead}_days.csv", "text/csv")
-
-# ============================================================ SIDEBAR 1 (login + upload)
-ids_prev = st.session_state.get("ids", [])
-if "pending" in st.session_state: st.session_state["sel"] = st.session_state.pop("pending")
-if st.session_state.get("sel") not in ids_prev: st.session_state.pop("sel", None)
-
-def _ok(u, p): return hmac.compare_digest(u.strip().lower().encode(), AUTH_USER.lower().encode()) and hmac.compare_digest(p.encode(), AUTH_PASS.encode())
-authed = st.session_state.get("auth", False)
-upl, paste, project = None, "", "AWD West Bengal"
-with st.sidebar:
-    st.markdown('<div class="sb-brand">🌾 DREAM <span>dMRV</span></div><div class="sb-h">Access</div>', unsafe_allow_html=True)
-    if authed:
-        st.markdown('<div class="lg-card"><div class="lg-ic ok">✓</div><div><b>Signed in</b><span>Upload your plots below</span></div></div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="lg-card"><div class="lg-ic">🔐</div><div><b>Unlock Studio</b><span>Verify your contributor credentials first</span></div></div>', unsafe_allow_html=True)
-        with st.form("login", border=False):
-            em = st.text_input("Contributor Email", placeholder="name@organisation")
-            pw = st.text_input("Passcode", type="password", placeholder="••••••••")
-            sub = st.form_submit_button("Authenticate", type="primary", use_container_width=True)
-        demo = st.button("⚡ Quick Demo Sign-In", use_container_width=True, key="demo")
-        if (sub and _ok(em, pw)) or demo: st.session_state["auth"] = True; st.rerun()
-        elif sub: st.error("Invalid email or passcode")
-    upl = st.file_uploader("Plots file", type=["geojson", "json", "kml", "zip", "gpkg", "csv", "tsv", "txt", "xlsx", "xls"], key="upl", disabled=not authed,
-                           help="GeoJSON / KML / SHP.zip / GPKG / CSV-TSV with wkt_geom / XLSX")
-    if not authed: st.caption("🔒 Locked until you sign in")
-    with st.expander("📋 Paste table instead"):
-        paste = st.text_area("Tab-separated, with a wkt_geom column", height=90, key="paste", disabled=not authed)
-    if authed:
-        st.markdown('<div class="sb-h">Project</div>', unsafe_allow_html=True); project = st.text_input("Project", project)
-
-if not gee_ok: st.error(f"Earth Engine init failed: {gee_err}"); st.stop()
-
-# ============================================================ HEADER (Logout sits level with Project)
-logo_html = f'<img src="{logo}">' if logo else "🌾"
-right_html = ((f'<span class="chip"><i class="dot on"></i>Active</span><span class="chip">Project: {project}</span>'
-               '<a class="chip ok" href="?logout=1" target="_self">⏻ Logout</a>') if authed else
-              '<span class="chip"><i class="dot off"></i>Inactive</span><span class="chip ok">● GEE Connected</span>')
-st.markdown('<div class="hero"><div class="strip"><span>DREAM · Digital Rice Emission Avoidance Methodology</span><span>Sentinel-1 GRD · CHIRPS V3 · Google Earth Engine</span></div>'
-            f'<div class="body">{logo_html}<div><h2>AWD dMRV Platform</h2><small>Farmer records vs Sentinel-1 · buffer gate · dB_wet · flowering lock</small></div>'
-            f'<div class="sp"></div>{right_html}</div></div>', unsafe_allow_html=True)
-
-if not authed:                                           # landing is shown ONLY before sign-in
-    landing(); st.stop()
-
-# ============================================================ FILE (optional) + SIDEBAR 2 (parameters)
-gdf_all, _sig, cols = None, None, []
-if upl is not None or paste.strip():
-    try: gdf_all = load_cached(upl.name if upl is not None else "", upl.getvalue() if upl is not None else b"", paste)
-    except Exception as e: st.error(f"Could not read the plots: {e}")
-if gdf_all is not None:
-    _sig = (upl.name, upl.size) if upl is not None else ("paste", len(paste))
-    cols = [c for c in gdf_all.columns if c != "geometry"]
-    if st.session_state.get("dr_sig") != _sig:           # file-based defaults, recomputed only for a new file
-        st.session_state["dr_default"] = auto_range(gdf_all, cols); st.session_state["dr_sig"] = _sig
-        st.session_state["n_rows_w"] = min(10, len(gdf_all))
-    st.session_state["n_rows_w"] = int(min(max(st.session_state.get("n_rows_w", 1), 1), max(len(gdf_all), 1)))
-
-cur = STORE["jobs"].get(st.session_state.get("job"))
-job_running = bool(cur and cur["status"] == "running")
-run, Qlive = False, None
-with st.sidebar:
-    if gdf_all is None:
-        st.markdown('<div class="sb-h">Parameters</div>', unsafe_allow_html=True)
-        st.caption("Upload plots above to set the analysis parameters.")
-    else:
-        with st.form("params"):
-            with st.expander("🗂 Column mapping", expanded=True):
-                def pick(label, guess, optional=False):
-                    opts = ([None] if optional else []) + cols
-                    return st.selectbox(label, opts, index=next((i for i, c in enumerate(opts) if c and guess in c.lower() and "iso" not in c.lower()), 0))
-                c_id = pick("Plot ID", "name"); c_fm = pick("Farmer", "farmer_name", True)
-                c_sw = pick("Sowing date", "sowing", True); c_tr = pick("Transplanting date", "transplant")
-                c_pp = pick("Pipe installation", "pipe", True)
-                c_a1 = pick("Aeration 1", "aeration_1", True); c_a2 = pick("Aeration 2", "aeration_2", True)
-            with st.expander("📅 Date range", expanded=True):
-                dr = st.date_input("From – To (used everywhere: S1, rain, graphs, ranges)", st.session_state["dr_default"], key=f"dr_{abs(hash(_sig))}",
-                                   help="Pre-filled from the dates in your file. Change it freely, then press Run analysis.")
-            with st.expander("🛰 Sentinel-1 settings"):
-                orbit = st.selectbox("Orbit", ["DESCENDING", "ASCENDING", "BOTH"])
-                buffer_m = st.number_input("Edge buffer (m)", 0, 30, 10)
-                det = st.radio("Detection band (drying)", ["VV", "VH", "VV+VH"], horizontal=True)
-                w0, w1 = st.slider("dB_wet search window (days after anchor date)", 0, 90, (0, 30))
-                delta = st.number_input("Delta above dB_wet (dB)", 0.5, 8.0, 3.0, 0.5)
-                tol = st.number_input("Match tolerance ± days", 1, 15, 6)
-            with st.expander("🌧 Rainfall classes"):
-                rain_mod = st.number_input("Moderate rain from (mm/day)", 1, 50, 10)
-                rain_thr = st.number_input("Heavy rain / gap-fill rain event (mm/day)", 5, 150, 20)
-                rain_mod = min(rain_mod, rain_thr)
-            with st.expander("🧩 Cluster (small plots)"):
-                cl_mode = st.radio("Aggregate into Cluster Polygons", ["Auto", "By column", "Off"], horizontal=True)
-                cl_col = st.selectbox("Cluster ID column (used by 'By column')", cols)
-                cl_micro = st.toggle("Also pull in touching micro-plots < 0.5 ha (Auto)", True)
-            with st.expander("🌱 Agronomy"):
-                anchor_mode = st.radio("Anchor date (dB_wet window & flowering lock)", ["Sowing", "Transplanting"], horizontal=True)
-                lock_on = st.toggle("Apply flowering-lock rule", False)
-                heading = st.number_input("Days to heading", 30, 150, 75)
-                cycle = st.number_input("Monitoring window (days after anchor)", 40, 200, 120)
-            with st.expander("♻ CH4 factors (editable)"):
-                ef = st.number_input("Baseline EF (kg CH4/ha/day)", 0.1, 10.0, 1.3)
-                sf = st.number_input("AWD scaling factor", 0.1, 1.0, 0.52)
-                gwp = st.number_input("GWP CH4", 20, 40, 28)
-                unc = st.number_input("Uncertainty deduction (%)", 0, 50, 15, help="Track 1 default 15%; 20% if ground-truth accuracy < 80%")
-            run = st.form_submit_button("▶ Run analysis", type="primary", use_container_width=True, disabled=job_running)
-
-if gdf_all is not None:
-    Qlive = dict(c_id=c_id, c_fm=c_fm, c_sw=c_sw, c_tr=c_tr, c_pp=c_pp, c_a1=c_a1, c_a2=c_a2, orbit=orbit, buffer_m=buffer_m, det=det, w0=w0, w1=w1,
-                 delta=delta, tol=tol, rain_mod=rain_mod, rain_thr=rain_thr, cl_mode=cl_mode, cl_col=cl_col if cl_mode == "By column" else None,
-                 cl_micro=bool(cl_micro) and cl_mode == "Auto", anchor_mode=anchor_mode, lock_on=lock_on, heading=heading, cycle=cycle,
-                 ef=ef, sf=sf, gwp=gwp, unc=unc, n_rows=int(st.session_state["n_rows_w"]),
-                 dr=(dr[0], dr[1]) if isinstance(dr, (tuple, list)) and len(dr) == 2 else None)
-    if run and not job_running:                          # start in the background, return immediately
-        gh = gdf_all.head(Qlive["n_rows"]).reset_index(drop=True)
-        st.session_state["job"] = start_job(gh, Qlive, gdf_all)
-        cur = STORE["jobs"][st.session_state["job"]]; job_running = True
-
-# adopt a finished background job (once)
-if cur and cur["status"] == "done" and st.session_state.get("adopted") != cur["id"]:
-    st.session_state["pipe"] = cur["result"]; st.session_state["adopted"] = cur["id"]; st.session_state["pipe_name"] = ""
-    st.session_state.pop("sel", None)
-
-# progress (right-edge vertical bar) / errors
-if cur:
-    if cur["status"] == "running": job_bar(cur["id"])
-    elif cur["status"] == "error" and st.session_state.get("job_seen") != cur["id"]:
-        st.error(f"Analysis stopped: {cur['err']}"); st.session_state["job_seen"] = cur["id"]
-
-PIPE = st.session_state.get("pipe")
-HAS = bool(PIPE) and "rep" in PIPE
-
-# ============================================================ ONE HORIZONTAL BAR:  [6 tabs] ... [◀ ▶] [💾 Save analysis]
-st.session_state.setdefault("ws", "run"); st.session_state.setdefault("page", "Spatial Audit")
-ws = st.session_state["ws"]
-def _ws(w): st.session_state["ws"] = w
-def _tab(k): st.session_state.update(page=k, ws="run")
-with st.container(key="nav"):
-    bc = st.columns([1.35] * len(NAV) + [0.8, 1.25], vertical_alignment="center")
-    for c_, (lab, key_) in zip(bc, NAV):
-        c_.button(lab, key=f"nav_{key_}", type="primary" if (ws == "run" and st.session_state["page"] == key_) else "secondary", use_container_width=True,
-                  disabled=(key_ == "Paddy"), help="Locked for now" if key_ == "Paddy" else None, on_click=_tab, args=(key_,))
-    with bc[len(NAV)]:
-        with st.container(key="arrows"):
-            a_l, a_r = st.columns(2)
-            a_l.button("◀", key="ws_l", on_click=_ws, args=("run",), disabled=ws == "run", use_container_width=True, help="Back to the analysis")
-            a_r.button("▶", key="ws_r", on_click=_ws, args=("saved",), disabled=ws == "saved", use_container_width=True, help="Open saved analyses")
-    with bc[len(NAV) + 1]:
-        with st.container(key="savebox"):
-            if HAS:
-                with st.popover("💾 Save analysis", use_container_width=True):
-                    uid = PIPE.get("uid", "x")
-                    nm = st.text_input("Name", value=st.session_state.get("pipe_name") or f"{project} · {PIPE['w_start']} → {PIPE['w_end']}", key=f"save_name_{uid}")
-                    if not hf_token(): st.warning("Add HF_TOKEN (write access) to st.secrets / environment first.")
-                    if st.button("Save to Hugging Face", type="primary", key=f"save_go_{uid}", use_container_width=True, disabled=not hf_token()):
-                        try:
-                            with st.spinner("Uploading to Hugging Face…"): aid = save_analysis(PIPE, nm.strip() or "Analysis", project)
-                            st.success(f"Saved ✓  {HF_FOLDER}/{aid}")
-                        except Exception as e: st.error(f"Save failed: {e}")
+col_map, col_leg = st.columns([3.2, 1.1])
+with col_map:
+    show_html(HTML.replace("__CFG__", json.dumps(cfg).replace("</", "<\\/")), 490)
+    c1, c2 = st.columns([1, 2])
+    c1.markdown("**Source : Survey of India**")
+    c2.markdown(f"**Topo sheet No. {sheets_str}**")
+with col_leg:
+    with st.container(height=480, border=True):
+        st.markdown("### **Legends**")
+        # main group: original vectors + their buffers (colours identical to the map) and the other layers
+        lg = "".join(
+            (f'<div class="lg"><i style="width:12px;height:12px;margin:0 5px;border-radius:50%;background:{c};'
+             f'border:2px solid #fff;box-shadow:0 0 0 1px #777"></i><b>{lab}</b></div>' if icon == "dot" else
+             f'<div class="lg">{WM_SVG}<b>{lab}</b></div>' if icon else
+             f'<div class="lg"><i style="border:{w}px {"dashed" if dash else "solid"} {c}"></i><b>{lab}</b></div>')
+            for lab, c, w, dash, icon in legend_rows(layers))
+        if on_dem:
+            lg += '<div class="lg"><b>Elevation in (m)</b></div>' + "".join(
+                f'<div class="lg"><i style="background:{c};border:1px solid #777"></i><b>{lb}</b></div>'
+                for c, lb in zip(DEM_PAL, dem_labels(terr[2])))
+        for lab, c, w, sty in line_rows(on_rd, on_con, water):
+            if sty == "fill":
+                lg += f'<div class="lg"><i style="background:{tint(c)};border:{w}px solid {c}"></i><b>{lab}</b></div>'
             else:
-                st.button("💾 Save analysis", key="save_off", disabled=True, use_container_width=True, help="Run an analysis first")
-st.write("")
-
-if ws == "saved":
-    saved_workspace(); st.stop()
-
-page = st.session_state["page"]
-if not HAS and gdf_all is None: st.stop()
-
-# ---- Inspect plot  +  Plots to audit (number of polygons), side by side as before
-_, sel_slot, nrow_slot = st.columns([2.4, 1.2, 1.4])
-n_rows = Qlive["n_rows"] if Qlive else 0
-if gdf_all is not None:
-    n_rows = int(nrow_slot.number_input(f"Plots to audit (file has {len(gdf_all)})", 1, max(len(gdf_all), 1), key="n_rows_w",
-                                        help="Applies the next time you press ▶ Run analysis."))
-
-# ---- no finished results yet: you can still browse the plots and use Satellite Path
-if not HAS:
-    if PIPE and PIPE.get("err"): st.error(PIPE["err"])
-    if PIPE and PIPE.get("s1_empty"):
-        Q0 = PIPE["Q"]
-        st.warning(f"No Sentinel-1 data came back. Plots passing the −{Q0['buffer_m']} m gate: {PIPE['n_gate']}. Window: {PIPE['w_start']} → {PIPE['w_end']}, orbit: {Q0['orbit']}. "
-                   "Try Orbit = BOTH, a smaller edge buffer, or a wider date range.")
-    pv = preview_gdf(gdf_all, Qlive["c_id"], n_rows)
-    if page == "Satellite Path": satellite_page(pv, pv.lat_c.mean(), pv.lon_c.mean())
-    elif page == "Spatial Audit": preview_map(pv)
-    else: st.info("This tab fills in when the analysis finishes." if job_running else "Press ▶ Run analysis in the side panel first.")
-    st.stop()
-
-# ---- results available: every setting comes from the run that produced them
-Q = PIPE["Q"]
-orbit, buffer_m, det, w0, w1, delta, tol = Q["orbit"], Q["buffer_m"], Q["det"], Q["w0"], Q["w1"], Q["delta"], Q["tol"]
-rain_thr, rain_mod, cl_mode, anchor_mode, lock_on = Q["rain_thr"], Q.get("rain_mod", min(10, Q["rain_thr"])), Q["cl_mode"], Q["anchor_mode"], Q["lock_on"]
-heading, cycle, ef, sf, gwp, unc = Q["heading"], Q["cycle"], Q["ef"], Q["sf"], Q["gwp"], Q["unc"]
-gdf, gdf_plots, cl_info, utm = PIPE["gdf"], PIPE["gdf_plots"], PIPE["cl_info"], PIPE["utm"]
-rain_cells, cell_of = PIPE["rain_cells"], PIPE["cell_of"]
-def rain_for(pid): return rain_cells.get(cell_of.get(pid), pd.DataFrame(columns=["date", "rain"]))
-
-w_start, w_end = PIPE["w_start"], PIPE["w_end"]
-XR = [str(w_start), str(w_end + dt.timedelta(days=1))]            # the chosen range is applied to every graph
-st.caption(f"📅 Date range in use: **{w_start} → {w_end}**" + (f"  ·  📂 Showing saved analysis: **{st.session_state['pipe_name']}**" if st.session_state.get("pipe_name") else ""))
-if PIPE.get("rain_err"): st.caption(f"CHIRPS unavailable: {PIPE['rain_err']}")
-res, rep = PIPE["res"], PIPE["rep"]
-st.session_state["ids"] = rep.Plot_ID.tolist()
-with sel_slot: sel = st.selectbox("Inspect plot", rep.Plot_ID.tolist(), key="sel")
-r = rep[rep.Plot_ID == sel].iloc[0]; g = gdf[gdf.pid == sel].iloc[0]; R = res[sel]; ts = R["ts"]
-
-# ============================================================ KPIs / CHART HELPERS
-n_valid = int((rep.Status == "VALID").sum()); tot_base = rep.Baseline_kgCH4.sum()
-pct = 100 * rep.Avoided_kgCH4.sum() / tot_base if tot_base else 0
-evs = [e for x in res.values() for e in x["ev"]]
-conf = 100 * sum(e["verdict"] == "CONFIRMED" for e in evs) / len(evs) if evs else 0
-cards = [("🌿", "#E3F7EC", f"{pct:.1f}%", "CH4 avoided vs baseline"), ("☁️", "#E3F0FF", f"{rep.Net_tCO2e.sum():,.2f}", f"tCO2e avoided (net of {unc}%)"),
-         ("✅", "#E8F7E3", f"{n_valid} / {len(rep)}", "Plots valid"), ("🛰", "#FFF1D6", f"{conf:.0f}%", "Farmer aerations confirmed by S1"),
-         ("📐", "#EDE7FF", f"{rep.Core_ha.sum():,.2f} ha", "Core area audited")]
-
-COL = {"VV": "#2F80ED", "VH": "#0FB5A6", "VV+VH": "#C026D3"}
-BANDS = {"VV": ["VV"], "VH": ["VH"], "VV & VH lines": ["VV", "VH"], "VV+VH combined": ["VV+VH"]}
-def marks_on(fig):
-    for i, (lab, d, c) in enumerate([("🌾 Sowing", g.sow, "#8B5E34"), ("🌱 Transplant", g.trans, "#16A34A"), ("🔧 Pipe", g.pipe_dt, "#64748B"),
-                                     ("💧 AE1 (farmer)", g.ae1, "#F97316"), ("💧 AE2 (farmer)", g.ae2, "#F97316")]):
-        if pd.isna(d): continue
-        fig.add_shape(type="line", x0=d, x1=d, y0=0, y1=1, xref="x", yref="paper", line=dict(color=c, width=2, dash="dot"))
-        fig.add_annotation(x=d, y=1.01 + 0.085 * (i % 2), yref="paper", yanchor="bottom", text=f"<b>{lab}</b><br>{d:%d %b}", showarrow=False,
-                           font=dict(size=10, color=c), bgcolor="#fff", bordercolor=c, borderwidth=1, borderpad=2)
-
-def chart(show, rain_on=True, audited_on=True, lock_vis=True):
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.2, 0.8])
-    rf = rain_for(sel) if rain_on else pd.DataFrame(); rain_idx, heavy_shapes = {"lo": [], "hi": []}, []
-    if not rf.empty:
-        for nm, part, colr, grp in [(f"Rain < {rain_mod} mm", rf[rf.rain < rain_mod], "#9CC9F5", "lo"),
-                                    (f"Rain {rain_mod}–{rain_thr} mm", rf[(rf.rain >= rain_mod) & (rf.rain < rain_thr)], "#3B8CF5", "lo"),
-                                    (f"Rain ≥ {rain_thr} mm (heavy)", rf[rf.rain >= rain_thr], "#E5484D", "hi")]:
-            if not part.empty:
-                fig.add_bar(x=part.date, y=part.rain, name=nm, marker_color=colr, row=1, col=1, hovertemplate="%{y:.1f} mm"); rain_idx[grp].append(len(fig.data) - 1)
-        fig.add_hline(y=rain_mod, row=1, col=1, line=dict(color="#3B8CF5", dash="dot", width=1), annotation_text=f"{rain_mod} mm", annotation_position="top left", annotation_font_size=9)
-        fig.add_hline(y=rain_thr, row=1, col=1, line=dict(color="#E5484D", dash="dot", width=1), annotation_text=f"{rain_thr} mm", annotation_position="top left", annotation_font_size=9)
-        heavy = rf[rf.rain >= rain_thr]
-        if not heavy.empty:
-            fig.add_scatter(x=heavy.date, y=heavy.rain, mode="markers+text", showlegend=False, row=1, col=1, text=[f"⛈ {v:.0f} mm" for v in heavy.rain],
-                            textposition="bottom center", textfont=dict(size=10, color="#C53030"), marker=dict(symbol="triangle-down", size=9, color="#E5484D"),
-                            hovertemplate="%{y:.1f} mm heavy rain")
-            rain_idx["hi"].append(len(fig.data) - 1)
-            for d in heavy.date:
-                heavy_shapes.append(len(fig.layout.shapes))
-                fig.add_shape(type="rect", x0=d - pd.Timedelta(hours=12), x1=d + pd.Timedelta(hours=12), y0=0, y1=1, xref="x", yref="paper", fillcolor="#E5484D", opacity=.10, line_width=0, layer="below")
-    for b in BANDS[show]:
-        if ts.empty: break
-        fig.add_scatter(x=ts.date, y=ts[b], name=f"{b} (dB)", mode="lines+markers", line=dict(color=COL[b], width=2.4), marker=dict(size=6), row=2, col=1, hovertemplate="%{y:.2f} dB")
-        fig.add_hline(y=R["wet"][b], row=2, col=1, line=dict(color=COL[b], dash="dot", width=1.2), annotation_text=f"dB_wet {b}", annotation_position="bottom right", annotation_font_size=10)
-        fig.add_hline(y=R["aer"][b], row=2, col=1, line=dict(color="#E5484D", dash="dash", width=1.2), annotation_text=f"Drying trigger {b}", annotation_position="top right", annotation_font_size=10)
-        fig.add_scatter(x=[R["wet_date"][b]], y=[R["wet"][b]], mode="markers", name=f"Min {b} (dB_wet)", row=2, col=1, marker=dict(symbol="star", size=15, color="#F5A623", line=dict(color="#fff", width=1.5)))
-    if not ts.empty:
-        a = ts[ts.aerated]
-        fig.add_scatter(x=a.date, y=a[det], mode="markers", name=f"S1 drying detected ({det})", row=2, col=1, marker=dict(symbol="diamond", size=11, color="#E5484D", line=dict(color="#fff", width=1.2)))
-        if audited_on: fig.add_scatter(x=ts.date, y=ts.audited, name=f"Audited {det} (lock applied)", mode="lines", row=2, col=1, line=dict(color="#1F2937", width=1.6, dash="dash"))
-        for e in R["ev"]:
-            if e["obs"] is not None and e["verdict"] == "CONFIRMED" and e.get("hit"):
-                fig.add_scatter(x=[e["obs"]], y=[e["val"]], mode="markers", showlegend=False, row=2, col=1, marker=dict(symbol="circle-open", size=26, color="#16A34A", line=dict(width=3)), hovertemplate=f"{e['name']} confirmed by S1")
-    if not ts.empty and pd.notna(g.anchor):
-        b0, b1 = g.anchor + pd.Timedelta(days=w0), g.anchor + pd.Timedelta(days=w1)
-        fig.add_shape(type="rect", x0=b0, x1=b1, y0=0, y1=1, xref="x", yref="paper", fillcolor="#2F80ED", opacity=.13, line=dict(color="#2F80ED", width=1, dash="dot"), layer="below")
-        fig.add_annotation(x=b0 + (b1 - b0) / 2, y=0.76, yref="paper", yanchor="top", showarrow=False, text=f"💧 Flooded-baseline window (day {w0}–{w1}) → dB_wet", font=dict(size=10, color="#1D5FD1"))
-    for a_, b_, _n in R["runs"]:
-        fig.add_shape(type="rect", x0=a_ - pd.Timedelta(hours=12), x1=b_ + pd.Timedelta(hours=12), y0=0, y1=0.77, xref="x", yref="paper", fillcolor="#16A34A", opacity=.13, line_width=0, layer="below")
-    if R["runs"]: fig.add_scatter(x=[None], y=[None], mode="markers", name="Credited dry days (≥ 3 d)", row=2, col=1, marker=dict(symbol="square", size=11, color="rgba(22,163,74,.35)"))
-    if lock_vis and pd.notna(R["ls"]):
-        fig.add_shape(type="rect", x0=R["ls"], x1=R["le"], y0=0, y1=1, xref="x", yref="paper", fillcolor="#FFC857", opacity=.22, line_width=0, layer="below")
-        fig.add_annotation(x=R["ls"] + (R["le"] - R["ls"]) / 2, y=0.0, yref="paper", text="🌸 Flowering lock", showarrow=False, font=dict(size=10, color="#B7791F"), yanchor="bottom")
-    marks_on(fig)
-    ms = dict(type="buttons", direction="right", y=1.22, yanchor="bottom", bgcolor="#fff", bordercolor="#C9D8EE", font=dict(size=11, color="#0A2342"), pad=dict(r=3, t=2, b=2))
-    anchor = g.sow if pd.notna(g.sow) else (g.trans if pd.notna(g.trans) else (ts.date.min() if not ts.empty else pd.NaT))
-    zb = []
-    if pd.notna(anchor):
-        for m in (1, 2, 3):
-            lo, hi = str(anchor.date()), str((anchor + pd.Timedelta(days=30 * m)).date())
-            zb.append(dict(label=f"{m}m", method="relayout", args=[{"xaxis.range": [lo, hi], "xaxis2.range": [lo, hi]}]))
-    zb.append(dict(label="All", method="relayout", args=[{"xaxis.range": XR, "xaxis2.range": XR}]))
-    menus = [dict(ms, x=0, xanchor="left", buttons=zb, active=len(zb) - 1)]
-    if rain_idx["lo"] or rain_idx["hi"]:
-        n = len(fig.data)
-        def vis(lo_on, hi_on):
-            v = [True] * n
-            for i in rain_idx["lo"]: v[i] = lo_on
-            for i in rain_idx["hi"]: v[i] = hi_on
-            return [{"visible": v}, {f"shapes[{k}].visible": hi_on for k in heavy_shapes}]
-        menus.append(dict(ms, x=1, xanchor="right", active=0, buttons=[dict(label="All rain", method="update", args=vis(True, True)),
-                          dict(label=f"< {rain_thr} mm", method="update", args=vis(True, False)), dict(label=f"≥ {rain_thr} mm", method="update", args=vis(False, True))]))
-    fig.add_annotation(x=0, y=1.29, xref="paper", yref="paper", xanchor="left", yanchor="bottom", showarrow=False, text="📅 Zoom from sowing date", font=dict(size=10, color="#6B84A3"))
-    fig.add_annotation(x=1, y=1.29, xref="paper", yref="paper", xanchor="right", yanchor="bottom", showarrow=False, text="🌧 Rainfall filter", font=dict(size=10, color="#6B84A3"))
-    fig.update_layout(template="plotly_white", height=720, hovermode="x unified", paper_bgcolor="#fff", plot_bgcolor="#fff", margin=dict(l=10, r=10, t=150, b=150),
-                      legend=dict(orientation="h", yanchor="top", y=-0.3, x=0, font_size=11),
-                      xaxis2=dict(rangeslider=dict(visible=True, thickness=0.05, range=XR)), updatemenus=menus)
-    fig.update_xaxes(range=XR)
-    rmax = float(rf.rain.max()) if not rf.empty else 0.0
-    fig.update_yaxes(title_text="Rain (mm)", range=[max(rmax, rain_thr) * 1.5, 0], row=1, col=1, showgrid=False)
-    fig.update_yaxes(title_text="Backscatter (dB)", row=2, col=1, gridcolor="#EEF3FA")
-    return fig
-
-def badge(v):
-    m = {"VALID": "b-ok", "CONFIRMED": "b-ok", "PARTIAL": "b-warn", "NOT_CONFIRMED": "b-warn", "DRY_NOT_CREDITED": "b-warn", "NO_PASS": "b-gray",
-         "LOCK_VIOLATION": "b-bad", "NO_AERATION": "b-warn", "NO_DATA": "b-gray", "REJECTED_SMALL": "b-bad"}
-    return f'<span class="badge {m.get(v, "b-gray")}">{v.replace("_", " ")}</span>'
-
-def event_cards():
-    if not R["ev"] and not R["extra"]: st.caption("No farmer aeration dates mapped for this plot."); return
-    cs = st.columns(max(len(R["ev"]) + (1 if R["extra"] else 0), 1))
-    for c, e in zip(cs, R["ev"]):
-        colr = {"CONFIRMED": "#16A34A", "NOT_CONFIRMED": "#F5A623", "DRY_NOT_CREDITED": "#F5A623", "NO_PASS": "#94A3B8"}[e["verdict"]]
-        if e["verdict"] == "CONFIRMED" and not e.get("hit"): msg = "Dry days credited around this date from the gap-filling rule (A 2.3.6), at least 3 consecutive days"
-        elif e["verdict"] == "DRY_NOT_CREDITED": msg = f"S1 saw a dry pass on {e['obs']:%d %b}, but it did not reach 3 consecutive creditable days (single pass, rain gap, or lock)"
-        elif e["verdict"] == "CONFIRMED": msg = f"S1 saw drying on <b>{e['obs']:%d %b}</b> ({abs((e['obs'] - e['date']).days)} d from report) · {det} {e['val']:.1f} dB ≥ trigger"
-        elif e["verdict"] == "NOT_CONFIRMED": msg = f"Nearest S1 pass {e['obs']:%d %b}: {det} {e['val']:.1f} dB stayed below the {R['aer'][det]:.1f} dB trigger → field still wet"
-        else: msg = f"No Sentinel-1 pass within ±{tol} days"
-        if pd.notna(R["ls"]) and R["ls"] <= e["date"] <= R["le"]: msg += "<br>⚠️ <b>Reported inside the flowering lock window</b> (field must stay flooded)"
-        c.markdown(f'<div class="ev" style="--c:{colr}"><b>{e["name"]}: farmer reported {e["date"]:%d %b %Y}</b> {badge(e["verdict"])}<div class="m">{msg}</div></div>', unsafe_allow_html=True)
-    if R["extra"]:
-        cs[-1].markdown('<div class="ev" style="--c:#E5484D"><b>Satellite-only drying</b><div class="m">S1 detected drying on ' + ", ".join(f"{d:%d %b}" for d in R["extra"]) + " with no matching farmer record.</div></div>", unsafe_allow_html=True)
-
-def controls(key):
-    a, b, c, d = st.columns([2.6, 1, 1, 1])
-    return (a.radio("Show band", list(BANDS), horizontal=True, key=f"b{key}"), b.toggle("CHIRPS rain", True, key=f"r{key}"),
-            c.toggle("Audited signal", False, key=f"a{key}"), d.toggle("Lock window", False, key=f"l{key}"))
-
-def method_panel():
-    n_pass = int((rep.Gate == "PASSED").sum())
-    items = [("A 2.3.2", "GRD pre-processing", f"Sentinel-1 GRD · IW · VV+VH · orbit {orbit} · multi-temporal ratio + 3×3 boxcar speckle filter"),
-             ("A 2.3.3", "Core-zone buffer gate", f"−{buffer_m} m inner buffer · {n_pass}/{len(rep)} plots pass"),
-             ("A 2.3.4", "Flooded baseline (dB_wet)", f"minimum {det} in days {w0}–{w1} after the {anchor_mode.lower()} date"),
-             ("A 2.3.5", "Aeration trigger", f"dB_wet + {delta} dB · matched to farmer dates ±{tol} d"),
-             ("A 2.4", "Flowering lock", (f"{anchor_mode.lower()} + {heading} d ± 10 d · always flooded" if lock_on else "rule switched off")),
-             ("A 2.3.6–7", "Gap-filling & 3-day rule", f"wet→dry from midpoint · dry→dry unless ≥{rain_thr} mm rain · credit only ≥3 consecutive dry days"),
-             ("A 2.3.3b", "Cluster polygons", f"mode {cl_mode} · {len(cl_info)} cluster(s) formed"),
-             ("Rain", "CHIRPS V3 daily", f"plot-centroid sample · classes <{rain_mod} / {rain_mod}–{rain_thr} / ≥{rain_thr} mm/day")]
-    st.markdown('<div class="card"><h4>📘 Methodology &amp; compliance</h4>' + "".join(
-        f'<div class="row"><span>{a} · {b}</span><span style="text-align:right;max-width:70%">{c}</span></div>' for a, b, c in items) + '</div>', unsafe_allow_html=True)
-    params = dict(buffer_m=buffer_m, orbit=orbit, detection_band=det, dB_wet_window_days=[w0, w1], delta_dB=delta, tolerance_days=tol, days_to_heading=heading,
-                  anchor=anchor_mode, cluster_mode=cl_mode, uncertainty_pct=unc, flowering_lock=lock_on, monitoring_days=cycle, moderate_rain_mm=rain_mod,
-                  heavy_rain_mm=rain_thr, ef=ef, scaling_factor=sf, gwp=gwp, window=[str(w_start), str(w_end)], plots_audited=len(rep))
-    st.download_button("⬇ Methodology parameters (JSON)", json.dumps(params, indent=2), "DREAM_parameters.json")
-
-# ============================================================ PAGES
-if page == "Spatial Audit":
-    if not cl_info.empty:                                   # cluster / gate notices live in this tab only
-        with st.expander(f"🧩 {len(cl_info)} Cluster Polygon(s) formed from small plots", expanded=False):
-            st.dataframe(cl_info, use_container_width=True)
-            if (cl_info.Max_date_spread_days > tol).any():
-                st.warning("Some clusters have members whose dates differ by more than the match tolerance; the cluster uses the median date.")
-    _rej = gdf[gdf.gate == "REJECTED"]
-    if len(_rej): st.warning(f"{len(_rej)} unit(s) have no core pixel after the −{buffer_m} m buffer and no neighbour to cluster with: " + ", ".join(_rej.pid.head(8)))
-    left, right = st.columns([1.7, 1])
-    with left:
-        c = g.geometry.centroid
-        m = folium.Map([c.y, c.x], zoom_start=17, tiles=None); esri(m); MousePosition().add_to(m)
-        sc = {"VALID": "#22C55E", "LOCK_VIOLATION": "#EF4444", "PARTIAL": "#F59E0B", "NOT_CONFIRMED": "#F59E0B"}
-        near = gdf
-        if len(gdf) > 300:
-            near = gdf.iloc[np.argsort(((gdf["lon_c"] - g["lon_c"]) ** 2 + (gdf["lat_c"] - g["lat_c"]) ** 2).to_numpy())[:300]]
-            st.caption(f"Map shows the 300 plots nearest to the selected one (of {len(gdf):,}).")
-        gj = near[["pid", "geometry"]].merge(rep[["Plot_ID", "Status"]], left_on="pid", right_on="Plot_ID")
-        folium.GeoJson(gj, name="Plots (status colour)", style_function=lambda f: {"color": sc.get(f["properties"]["Status"], "#94A3B8"), "weight": 2, "fillOpacity": .08},
-                       tooltip=folium.GeoJsonTooltip(["pid", "Status"])).add_to(m)
-        folium.GeoJson(g.geometry.__geo_interface__, name="Selected raw boundary", style_function=lambda f: {"color": "red", "fillOpacity": 0, "weight": 3}).add_to(m)
-        if g.n_members > 1:
-            folium.GeoJson(gdf_plots[gdf_plots.pid.isin(str(g.members).split(", "))][["pid", "geometry"]], name="Cluster member plots",
-                           style_function=lambda f: {"color": "#F59E0B", "weight": 2, "fillOpacity": .15}, tooltip=folium.GeoJsonTooltip(["pid"])).add_to(m)
-        cb = gpd.GeoSeries(g.geometry, crs=4326).to_crs(utm).buffer(-buffer_m).to_crs(4326)
-        if not cb.iloc[0].is_empty:
-            folium.GeoJson(cb.__geo_interface__, name=f"Buffered core (-{buffer_m} m)", style_function=lambda f: {"color": "cyan", "weight": 3, "fillOpacity": .15}).add_to(m)
-        folium.LayerControl().add_to(m)
-        out = st_folium(m, height=420, use_container_width=True, returned_objects=["last_active_drawing"])
-        pid_ = (((out or {}).get("last_active_drawing") or {}).get("properties") or {}).get("pid")
-        if pid_ and pid_ != sel and pid_ != st.session_state.get("last_click"):
-            st.session_state["last_click"] = pid_; st.session_state["pending"] = pid_; st.rerun()
-    with right:
-        f = lambda d: d.strftime("%d %b %Y") if pd.notna(d) else "—"
-        nm = lambda x: f"{x:.2f} dB" if pd.notna(x) else "—"
-        st.markdown('<div class="card" style="min-height:455px"><h4>🔍 Plot Audit Inspector</h4>' +
-            "".join(f'<div class="row"><span>{a}</span><span>{b}</span></div>' for a, b in [
-            ("Plot ID", sel), ("Farmer", r.Farmer), ("Gate", f"{r.Gate} (−{buffer_m} m)"), ("Core area", f"{r.Core_ha} ha"),
-            ("Sowing", f(g.sow)), ("Transplant", f(g.trans)), ("Pipe installed", f(g.pipe_dt)),
-            (f"dB_wet ({det})", nm(R['wet'].get(det))), ("Min reached on", f(R['wet_date'].get(det))), (f"Drying trigger (+{delta} dB)", nm(R['aer'].get(det))),
-            ("Flowering lock", f"{R['ls']:%d %b} – {R['le']:%d %b}" if pd.notna(R['ls']) else "—"),
-            ("S1 observations", R["n_obs"]), ("Lock violations", R["lock_hits"]), ("Credited dry days", f"{R['dry_days']} in {R['dry_events']} event(s)"),
-            ("Anchor date", f(g.anchor)), ("Unit", "Cluster of " + str(int(g.n_members)) + " plots" if g.n_members > 1 else "Single plot")]) +
-            f'<div style="margin-top:10px">Status: {badge(R["status"])}</div></div>', unsafe_allow_html=True)
-    st.markdown("#### 📈 Farmer actions vs Sentinel-1 · rainfall on top, backscatter below")
-    show, rain_on, aud_on, lock_vis = controls("main")
-    st.plotly_chart(chart(show, rain_on, aud_on, lock_vis), use_container_width=True)
-    st.markdown("#### 🧾 Verification: did the satellite see what the farmer reported?")
-    event_cards(); st.write(""); method_panel()
-
-elif page == "Export":
-    kpi_row(cards); st.write("")
-    a, b = st.columns([2, 1])
-    fig = go.Figure()
-    fig.add_bar(x=rep.Plot_ID, y=rep.Avoided_kgCH4, name="CH4 avoided (kg)", marker_color="#16A34A")
-    fig.add_bar(x=rep.Plot_ID, y=rep.Baseline_kgCH4 - rep.Avoided_kgCH4, name="Remaining emission (kg)", marker_color="#9CC9F5")
-    fig.update_layout(template="plotly_white", barmode="stack", height=380, title="Baseline CH4 per plot: avoided vs remaining (kg)", margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=-0.2))
-    a.plotly_chart(fig, use_container_width=True)
-    cnt = rep.Status.value_counts()
-    pie = go.Figure(go.Pie(labels=cnt.index, values=cnt.values, hole=.55)); pie.update_layout(template="plotly_white", height=380, title="Plot status", margin=dict(l=10, r=10, t=40, b=10))
-    b.plotly_chart(pie, use_container_width=True)
-    net = go.Figure(go.Bar(x=rep.Plot_ID, y=rep.Net_tCO2e, marker_color="#2F80ED"))
-    net.update_layout(template="plotly_white", height=300, title=f"Net tCO2e per plot (after {unc}% deduction)", margin=dict(l=10, r=10, t=40, b=10))
-    st.plotly_chart(net, use_container_width=True)
-    st.caption("Estimate = EF × window days × core ha × (1 − scaling factor), VALID plots only. Replace factors with your approved methodology values.")
-    st.dataframe(rep, use_container_width=True)
-    X = PIPE["exp"]
-    st.markdown("##### ⬇ Export audit results")
-    for col, (lab, k, fn, mime) in zip(st.columns(4), [("CSV", "csv", "DREAM_audit.csv", "text/csv"), ("KML", "kml", "DREAM_audit.kml", "application/vnd.google-earth.kml+xml"),
-                                                        ("GeoJSON", "geojson", "DREAM_audit.geojson", "application/geo+json"), ("Shapefile (zip)", "shp", "DREAM_audit_shp.zip", "application/zip")]):
-        col.download_button(f"⬇ {lab}", X[k] or b"", fn, mime, use_container_width=True, disabled=X[k] is None, key=f"dl_{k}")
-    st.markdown("##### 📏 Extract Ranges")
-    RG = PIPE["ranges"]
-    st.caption(f"All {len(RG)} uploaded plots: original attributes + Range_from / Range_to / Range_days (clipped to the side-panel date range) + "
-               "`range` = boundary as a JSON-style list of {\"lat\": …, \"lng\": …} dictionaries. CSV only.")
-    if PIPE.get("ranges_err"): st.warning(f"Ranges could not be computed ({PIPE['ranges_err']}); attributes only.")
-    st.download_button("⬇ Extract Ranges CSV", RG.to_csv(index=False), "DREAM_extract_ranges.csv", "text/csv")
-
-elif page == "Multispectral Analysis":
-    INFO = {"NDVI": ("Greenness / crop vigour. The peak is roughly the heading stage.", "#16A34A"), "NDMI": ("Canopy moisture (NIR vs SWIR). Falls when the crop or soil dries.", "#0FB5A6"),
-            "NDWI": ("Open water (green vs NIR). Above 0 usually means standing water.", "#2F80ED"), "MNDWI": ("Water and wet soil (green vs SWIR). Good in the early, open-canopy stage.", "#7C3AED"),
-            "EVI": ("Greenness that does not saturate in dense canopy.", "#F59E0B"), "SAVI": ("Greenness with soil-background correction for sparse early canopy.", "#8B5E34")}
-    st.markdown("#### 🛰️ Sentinel-2 multispectral analysis")
-    with st.form("s2form"):
-        c1, c2, c3, c4 = st.columns([2.4, 1, 1, 1])
-        idxs = c1.multiselect("Indices", list(INFO), default=["NDVI", "NDMI", "NDWI"])
-        cloud = c2.slider("Max scene cloud %", 10, 100, 60, 5)
-        minclear = c3.slider("Min clear share in plot", 0.1, 1.0, 0.5, 0.1)
-        c4.write(""); s2_run = c4.form_submit_button("▶ Run Sentinel-2", type="primary", use_container_width=True)
-    if s2_run: st.session_state["s2"] = dict(idxs=idxs, cloud=cloud, minclear=minclear)
-    req = st.session_state.get("s2")
-    if not req: st.info("Pick the indices and press ▶ Run Sentinel-2. It analyses the plot chosen under 'Inspect plot'.")
-    else:
-        cg = gpd.GeoSeries([g.geometry], crs=4326).to_crs(utm).buffer(-buffer_m).to_crs(4326).iloc[0]
-        with st.spinner("Querying Sentinel-2 on Earth Engine…"):
-            d2 = fetch_s2(json.dumps(mapping(g.geometry if cg.is_empty else cg)), str(w_start), str(w_end + dt.timedelta(days=1)), req["cloud"])
-        d2 = d2[d2.clear >= req["minclear"]] if not d2.empty else d2
-        if d2.empty: st.warning("No usable Sentinel-2 scenes for this plot and window. Raise the cloud limit or lower the clear-share limit (monsoon clouds are common).")
+                lg += f'<div class="lg"><i style="height:0;border-top:{w}px solid {c}"></i><b>{lab}</b></div>'
+        if vil_fc:
+            lg += f'<div class="lg"><i style="background:{tint(VIL_COL)};border:1px solid {VIL_COL}"></i><b>Bhuvan Village Boundary</b></div>'
+        # vantage group: shown only while the Vantage tab is open (or when the open tab cannot be detected)
+        lv = ""
+        if vs_b:
+            lv = f'<div class="lg"><b>Vantage analysis (Batch 1)</b></div><div class="lg">{WM_SVG}<b>WTG (site)</b></div>'
+            for n, b in enumerate(vs_b, 1):
+                lv += (f'<div class="lg"><i style="width:12px;height:12px;margin:0 5px;border-radius:50%;background:{VS_COL[(n - 1) % 3]};'
+                       f'border:2px solid #fff;box-shadow:0 0 0 1px #777"></i><b>Vantage Batch {n} ({len(b["pts"])} points)</b></div>')
+            lv += (f'<div class="lg"><i style="height:0;border-top:3px dashed {VS_BUF_COL}"></i>'
+                   f'<b>WTG buffer {fmt_m(vs_args[3])}</b></div>')
+            if vr:
+                lv += (f'<div class="lg"><i style="background:linear-gradient(90deg,{tint(VS_RAS, .55)},{VS_RAS},#015a85);border:1px solid #777"></i>'
+                       '<b>Visibility raster (darker = more WTGs)</b></div>')
+        if lg or lv:
+            st.markdown(f'<div class="lgg lgg-main">{lg}</div>' + (f'<div class="lgg lgg-vs">{lv}</div>' if lv else ""),
+                        unsafe_allow_html=True)
         else:
-            use = [k for k in req["idxs"] if k in d2.columns]; pk = d2.loc[d2.NDVI.idxmax()]
-            kpi_row([("🌱", "#E3F7EC", f"{pk.NDVI:.2f}", f"NDVI peak · {pk.date:%d %b}"),
-                     ("📅", "#E3F0FF", (f"{(pk.date - g.anchor).days} d" if pd.notna(g.anchor) else "—"), "Peak NDVI, days after anchor"),
-                     ("💧", "#E8F7E3", f"{int((d2.MNDWI > 0).sum())} of {len(d2)}", "Scenes with MNDWI > 0 (water)"), ("🛰", "#FFF1D6", f"{len(d2)}", "Clear Sentinel-2 scenes used")])
-            st.write("")
-            f2 = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.03, row_heights=[0.2, 0.8]); rf2 = rain_for(sel)
-            if not rf2.empty:
-                f2.add_bar(x=rf2.date, y=rf2.rain, name="CHIRPS rain (mm/d)", row=1, col=1, hovertemplate="%{y:.1f} mm", marker_color=["#E5484D" if v >= rain_thr else "#7DB8F5" for v in rf2.rain])
-            for k in use: f2.add_scatter(x=d2.date, y=d2[k], name=k, mode="lines+markers", line=dict(color=INFO[k][1], width=2.2), marker=dict(size=7), row=2, col=1, hovertemplate="%{y:.3f}")
-            if "NDVI" in use: f2.add_scatter(x=[pk.date], y=[pk.NDVI], mode="markers", name="NDVI peak", row=2, col=1, marker=dict(symbol="star", size=15, color="#F5A623", line=dict(color="#fff", width=1.5)))
-            f2.add_hline(y=0, row=2, col=1, line=dict(color="#94A3B8", dash="dot", width=1)); marks_on(f2)
-            rmax = float(rf2.rain.max()) if not rf2.empty else 0.0
-            f2.update_layout(template="plotly_white", height=680, hovermode="x unified", paper_bgcolor="#fff", plot_bgcolor="#fff", margin=dict(l=10, r=10, t=110, b=140),
-                             legend=dict(orientation="h", yanchor="top", y=-0.3, x=0, font_size=11), xaxis2=dict(rangeslider=dict(visible=True, thickness=0.05, range=XR)))
-            f2.update_xaxes(range=XR)
-            f2.update_yaxes(title_text="Rain (mm)", range=[max(rmax, rain_thr) * 1.5, 0], row=1, col=1, showgrid=False)
-            f2.update_yaxes(title_text="Index value", row=2, col=1, gridcolor="#EEF3FA")
-            st.plotly_chart(f2, use_container_width=True)
-            with st.expander("What do these indices tell me?"):
-                st.markdown("\n".join(f"- **{k}**: {v[0]}" for k, v in INFO.items()))
-                st.caption("Sentinel-2 is optical, so cloudy monsoon dates are removed (SCL mask) and gaps are normal. Use it to support the radar result, not to replace it.")
-            st.dataframe(d2[["date"] + use + ["clear", "cloud"]].round(3), use_container_width=True)
-            st.download_button("⬇ Sentinel-2 indices CSV", d2.to_csv(index=False), f"DREAM_S2_{sel}.csv")
+            st.markdown("Upload a vector to see its legend.")
+        if leg_bytes:
+            st.image(leg_bytes, caption="CONVENTIONAL SYMBOLS", width="stretch")
 
-elif page == "Ground truth":
-    st.markdown("#### 🧪 Ground-truth accuracy check (DREAM 13.4)")
-    st.caption("Upload water-tube observations (Pani-pipe photos or sensor readings): one row per observation with plot ID, date and wet/dry.")
-    gt = st.file_uploader("Observations (CSV / XLSX)", type=["csv", "xlsx"], key="gt")
-    if gt is None: st.info("Columns needed: plot ID, date, and either text (Wet/Dry, Water visible/Soil visible) or water level in cm."); st.stop()
-    gdf_in = pd.read_csv(gt, dtype=str) if gt.name.lower().endswith("csv") else pd.read_excel(gt, dtype=str)
-    c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 1.2])
-    gid, gdate, gval = c1.selectbox("Plot ID", gdf_in.columns), c2.selectbox("Date", gdf_in.columns), c3.selectbox("Observation", gdf_in.columns)
-    gval2 = c4.selectbox("Water level column (optional)", [None] + list(gdf_in.columns))
-    kind = c5.radio("Observation type", ["Text (wet/dry)", "Water level (cm)"], horizontal=True)
-    to_unit = {m.strip(): u for u, ms in zip(gdf.pid, gdf.members) for m in str(ms).split(",")}
-    def num_dry(v):
-        if pd.isna(v): return None
-        try: return float(str(v).strip()) <= -15
-        except ValueError: return None
-    def gt_dry(v):
-        if pd.isna(v): return None
-        t = str(v).strip().lower()
-        if kind.startswith("Water"):
-            try: return float(t) <= -15
-            except ValueError: return None
-        if any(k in t for k in ("dry", "soil", "aerat", "drain")): return True
-        if any(k in t for k in ("wet", "water", "flood")): return False
-        return None
-    def sat_dry(pid, d):
-        R_ = res.get(to_unit.get(str(pid).strip(), str(pid).strip()))
-        if R_ is None or R_["daily"].empty: return None
-        row = R_["daily"][R_["daily"].date == d]
-        return None if row.empty else bool(row.dry.iloc[0])
-    t = pd.DataFrame({"Plot": gdf_in[gid], "Date": gdf_in[gdate].apply(parse_day).dt.normalize(),
-                      "Ground": [a if a is not None else b for a, b in zip(gdf_in[gval].apply(gt_dry), gdf_in[gval2].apply(num_dry) if gval2 else [None] * len(gdf_in))]})
-    t["Satellite"] = [sat_dry(p_, d_) for p_, d_ in zip(t.Plot, t.Date)]
-    t["Match"] = [("✔" if a == b else "✘") if (a is not None and b is not None and not pd.isna(a) and not pd.isna(b)) else "—" for a, b in zip(t.Ground, t.Satellite)]
-    ok = t.dropna(subset=["Ground", "Satellite"])
-    if ok.empty: st.warning("No observation matched a plot/date with satellite status. Check plot IDs, dates and the audit window."); st.dataframe(t, use_container_width=True); st.stop()
-    tp = int(((ok.Ground == True) & (ok.Satellite == True)).sum()); tn = int(((ok.Ground == False) & (ok.Satellite == False)).sum())
-    fp = int(((ok.Ground == False) & (ok.Satellite == True)).sum()); fn = int(((ok.Ground == True) & (ok.Satellite == False)).sum())
-    acc = 100 * (tp + tn) / len(ok)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Accuracy", f"{acc:.1f}%", "pass ≥ 80%" if acc >= 80 else "below 80%", delta_color="normal" if acc >= 80 else "inverse")
-    m2.metric("Matched samples", f"{len(ok)} of {len(t)}"); m3.metric("Uncertainty deduction", "15%" if acc >= 80 else "20%")
-    if acc < 80: st.error("Accuracy below 80%: the draft (13.4.2.2) raises the deduction to 20% for this period and requires recalibrating the backscatter thresholds before the next season.")
-    cm = go.Figure(go.Heatmap(z=[[tp, fn], [fp, tn]], x=["Satellite dry", "Satellite wet"], y=["Ground dry", "Ground wet"], text=[[tp, fn], [fp, tn]], texttemplate="%{text}", colorscale="Blues", showscale=False))
-    cm.update_layout(template="plotly_white", height=300, margin=dict(l=10, r=10, t=30, b=10), title="Confusion matrix")
-    st.plotly_chart(cm, use_container_width=True)
-    _lab = lambda v: "—" if v is None or pd.isna(v) else ("Dry" if v else "Wet")
-    shown = t.copy(); shown["Date"] = shown.Date.dt.strftime("%d %b %Y"); shown["Ground"], shown["Satellite"] = shown.Ground.map(_lab), shown.Satellite.map(_lab)
-    _clr = lambda v: ("background-color:#FFE4CC;color:#C2570C;font-weight:600" if v == "Dry" else "background-color:#DCEBFF;color:#1D5FD1;font-weight:600" if v == "Wet" else "")
-    sty = shown.style; sty = (sty.map if hasattr(sty, "map") else sty.applymap)(_clr, subset=["Ground", "Satellite"])
-    st.caption("🟧 Dry (orange) · 🟦 Wet (blue)"); st.dataframe(sty, use_container_width=True)
 
-elif page == "Satellite Path":
-    satellite_page(gdf, g.lat_c, g.lon_c)
+# ---------------- georeferencing status ----------------
+@st.fragment(run_every=2 if geo_busy else None)
+def geo_ui():
+    j = GEO.get(st.session_state.get("geo_id"))
+    refresh_geo(j)
+    if not j:
+        return
+
+    def end():
+        gid = st.session_state.pop("geo_id", None)
+        kill_job(j)
+        drop_static(gid)
+        GEO.pop(gid, None)
+        st.session_state.pop("geo_poll", None)
+
+    def clear_btn(label="🗑️ Clear"):
+        if st.button(label, key="geo_x", width="stretch"):
+            end()
+            st.rerun()
+
+    if j["status"] != "running" and (j.get("push") or {}).get("status") != "running" and st.session_state.pop("geo_poll", False):
+        st.rerun()
+    for nm in j["skipped"]:
+        st.warning(f"{nm}: no matching sheet - skipped.")
+    el = int((j["end"] or time.time()) - j["start"])
+    if j["status"] == "running":
+        st.progress(min(j["progress"], .99), text=f"Processing: {j['msg']}  |  {el}s  (background - keep working)")
+        return clear_btn("⛔ Cancel")
+    if j["status"] == "error":
+        st.error(f"Processing failed: {j['error']}")
+        return clear_btn()
+    ok = [r for r in j["results"] if "error" not in r]
+    for r in j["results"]:
+        if "error" in r:
+            st.error(f"{r['name']}: {r['error']}")
+    pu = j.get("push") or {}
+    if pu.get("status") == "done":
+        release_assets.clear()
+        end()
+        st.rerun()
+    if not ok:
+        return clear_btn()
+    st.markdown("### 🧭 New sheets")
+    st.caption(f"Done in {el}s. Check that they line up on the map, then download or add them to the library.")
+    st.markdown("| Sheet | Zoom | Tiles | Size | Already in library |\n|---|---|---|---|---|\n" + "\n".join(
+        f"| {r['name']} | {r['zoom'][0]}-{r['zoom'][1]} | {r['tiles']} | {r['pm_mb']} MB | "
+        f"{'yes (skipped)' if r['name'] + '.pmtiles' in pm_assets else 'no'} |" for r in ok))
+    cols = st.columns(4)
+    for i, r in enumerate([r for r in ok if r.get("tif_mb")]):
+        with open(os.path.join(j["dir"], r["name"] + ".tif"), "rb") as fh:
+            cols[i % 4].download_button(f"⬇️ {r['name']} (GeoTIFF, {r['tif_mb']} MB)", fh.read(), file_name=r["name"] + ".tif",
+                                        mime="image/tiff", width="stretch", key=f"geo_dl{i}")
+    new = [r for r in ok if r["name"] + ".pmtiles" not in pm_assets]
+    if pu.get("status") == "running":
+        st.info("☁️ Adding to the library in the background...")
+    elif not new:
+        st.info("All sheets are already in the library.")
+    else:
+        if pu.get("status") == "error":
+            st.error(f"Upload failed: {pu['msg']}")
+        sure = st.checkbox("✅ I checked the map - the sheet(s) line up correctly", key="geo_ok")
+        if st.button("☁️ Add to library", type="primary", disabled=not sure, key="geo_push", width="stretch"):
+            wt = write_token()
+            if not wt:
+                st.error("No write token: set HF_WRITE_TOKEN (env or Streamlit secret).")
+            else:
+                dirs = [os.path.dirname(p) for p in pm_assets.values() if not p.startswith("contributions/")]
+                folder = max(set(dirs), key=dirs.count) if dirs else ""
+                push_bg(j, [(os.path.join(j["dir"], r["name"] + ".pmtiles"), f"{folder}/{r['name']}.pmtiles".lstrip("/"))
+                            for r in new], wt)
+                st.session_state["geo_poll"] = True
+                st.rerun()
+    clear_btn("🗑️ Clear")
+
+
+geo_ui()
+
+for jid, j in list(JOBS.items()):
+    if j["status"] != "running" and j.get("end") and time.time() - j["end"] > JOB_TTL:
+        JOBS.pop(jid, None)
+job = JOBS.get(st.session_state.get("job_id"))
+refresh_job(job)
+
+opts = [k for k, ok in (("Toposheet Map", show_topo and (chosen or geo_ov)), ("DEM - Elevation Map", on_dem),
+                        ("DEM - Contour Map", on_dem and on_con), ("Roads & Transportation Map", on_rd),
+                        ("Drainage Map", on_wt), ("Satellite Map", bool(layers))) if ok] or ["Toposheet Map"]
+
+
+@st.fragment(run_every=1.5 if (job and job["status"] == "running") else None)
+def export_ui():
+    job = JOBS.get(st.session_state.get("job_id"))
+    refresh_job(job)
+    running = bool(job) and job["status"] == "running"
+    if job and not running and st.session_state.pop("polling", False):
+        st.rerun()
+
+    cl, ck, cd, cb = st.columns([1.1, 1.9, 1.2, 2.6])
+    cl.markdown("### 📥 Export Map")
+    kind = ck.selectbox("Map type", opts, label_visibility="collapsed", disabled=running)
+    dpi = cd.selectbox("Resolution (DPI)", DPI_OPTIONS, index=0, label_visibility="collapsed", disabled=running)
+
+    if running:
+        if cb.button("⛔ Cancel export", width="stretch"):
+            kill_job(job, "cancelled")
+            st.session_state.pop("polling", None)
+            st.rerun()
+    elif cb.button("🚀 Generate High-Res Map", type="primary", width="stretch"):
+        hd, hc, hr, hw, hs = KINDS[kind]
+        topo = not any(KINDS[kind])
+        if topo and not (chosen or geo_ov):
+            st.warning("No toposheets found in the library.")
+        elif hs and not layers:
+            st.warning("Upload at least one vector first (the satellite map shows the vectors).")
+        else:
+            if job:
+                JOBS.pop(st.session_state.get("job_id"), None)
+            jid = uuid.uuid4().hex
+            extra = {"dem": terr[:3] if hd else None, "contours": terr[3] if hc else None,
+                     "roads": road_fc if hr else None, "water": water if hw else None, "logo": logo_bytes,
+                     "base": None if topo else SAT_BASE if hs else BASEMAPS[basemap]}
+            JOBS[jid] = start_export([pm_assets[n] for n in chosen] + geo_local if topo else [], layers, project_title, sheets_str,
+                                     dpi, leg_bytes if topo else None, kind, extra)
+            st.session_state["job_id"] = jid
+            st.session_state["polling"] = True
+            st.rerun()
+
+    if job:
+        elapsed = int((job["end"] or time.time()) - job["start"])
+        if job["status"] == "running":
+            st.progress(min(job["progress"], 0.99), text=f"{job['msg']}  |  elapsed {elapsed}s")
+            st.caption("You can change basemap / layers while this runs. The export keeps going.")
+        elif job["status"] == "done":
+            st.success(f"{job['kind']} ready in {elapsed}s ({job['dpi']} DPI).")
+            if job.get("warn"):
+                st.warning(f"Failed to load (white areas): {job['warn']}. Generate again.")
+            st.download_button("⬇️ Download Ready High-Res Map (PNG)", job["result"],
+                               file_name=re.sub(r"\W+", "_", job["kind"]) + "_HighRes.png", mime="image/png", width="stretch")
+        elif job["status"] == "cancelled":
+            st.warning("Export cancelled.")
+        elif job["status"] == "error":
+            st.error(f"Export failed: {job['error']}")
+
+
+# ---------------- deliverables ----------------
+slug = lambda s: re.sub(r"\W+", "_", s).strip("_")
+fc_geoms = lambda fc: [shape(f["geometry"]) for f in fc["features"]]
+dls = []
+for l in layers:
+    k0 = l["key"]
+    dls.append((f"⬇️ {l['name']} (KML)",
+                memo(("site", k0), lambda l=l: to_kml(
+                    l["name"], [(feat_name(f["props"], l["name"]), shape(f["geom"]), f["props"]) for f in l["feats"]],
+                    l.get("scol", COLORS[0]))),
+                slug(l["name"]) + ".kml", KML))
+    for i, b in enumerate(l["bufs"]):
+        dls.append((f"⬇️ {b['label']} (KML)",
+                    memo(("buf", k0, i), lambda b=b, i=i, l=l: to_kml(
+                        b["label"], [(b["label"], g) for g in fc_geoms(b["gj"])], buf_color(i, len(l["bufs"]), l["cols"]))),
+                    slug(b["label"]) + ".kml", KML))
+if on_dem:
+    dls.append(("⬇️ DEM (GeoTIFF)", dem_tif_bytes(ou_wkb), "dem_30m.tif", "image/tiff"))
+if on_con:
+    dls.append(("⬇️ Contours (KML)",
+                memo(("con", okey), lambda: to_kml(
+                    f"Contour {CONTOUR_STEP} meter",
+                    [(f"{int(f['properties']['elev'])} m", shape(f["geometry"])) for f in terr[3]["features"]], CON_COL, 1)),
+                f"contours_{CONTOUR_STEP}m_min_length_{CONTOUR_MIN_LEN}m.kml", KML))
+if on_rd:
+    dls.append(("⬇️ Roads (KML)",
+                memo(("rd", okey, rv), lambda: to_kml("Roads", [("Roads", GeometryCollection(fc_geoms(road_fc)))], ROAD_COL)),
+                "roads.kml", KML))
+for k, fc in water.items():
+    lab, stem, col = DRAIN[k]
+    dls.append((f"⬇️ {lab} (KML)",
+                memo(("wt", k, okey, wv.get(k)), lambda lab=lab, fc=fc, col=col: to_kml(
+                    lab, [(lab, GeometryCollection(fc_geoms(fc)))], col, 1)),
+                stem + ".kml", KML))
+for n, b in enumerate(vs_res["batches"] if vs_res else [], 1):   # all 3 batches are exported
+    tag, vk = f"Batch_{n}_Target_{int(vs_args[2])}m", hash(vs_args)
+    dls.append((f"⬇️ Vantage Batch {n} (KML)", memo(("vk", vk, n), lambda n=n, b=b: vp_kml(n, b)),
+                f"Vantage_Points_{tag}.kml", KML))
+    dls.append((f"⬇️ Visibility Batch {n} (TIF)", memo(("vt", vk, n), lambda b=b: geotiff_bytes(b["cov"], vs_res["g"], 0)),
+                f"Visibility_Coverage_{tag}.tif", "image/tiff"))
+with st.container(border=True):
+    st.markdown('<div class="sec">Deliverables</div>', unsafe_allow_html=True)
+    for i, (lab, data, nm, mime) in enumerate(dls):
+        if i % 5 == 0:
+            cols = st.columns(5)
+        cols[i % 5].download_button(lab, data, nm, mime, width="stretch", key=f"dl{i}")
+    export_ui()
+
+st.markdown("""
+<div class="custom-footer">Developed by <b>Himanshu Gupta</b> &nbsp;|&nbsp;
+📧 <a href="mailto:himanshu.guptta.311@gmail.com">himanshu.guptta.311@gmail.com</a> &nbsp;|&nbsp;
+🔗 <a href="https://www.linkedin.com/in/himanshu-gupta-4a7942224" target="_blank">LinkedIn Profile</a></div>
+""", unsafe_allow_html=True)
